@@ -1,0 +1,10 @@
+[requires]
+poco/1.13.3
+boost/1.85.0
+lmdb/0.9.31
+spdlog/1.13.0
+fmt/10.2.1
+
+[generators]
+CMakeDeps
+CMakeToolchain

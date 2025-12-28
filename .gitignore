@@ -1,0 +1,74 @@
+# Build directories
+/build/
+/cmake-build-debug/
+/out/
+/bin/
+/lib/
+
+# CMake cache and generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Visual Studio / MSVC
+*.vcxproj.user
+*.suo
+*.user
+*.ipch/
+*.VC.db
+*.VC.opendb
+*.pdb
+*.ilk
+
+# Visual Studio Solution user options
+*.sln.docstates
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# Conan
+conanbuildinfo.*
+conaninfo.txt
+conan.lock
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# Compiled objects and binaries
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Test artifacts
+coverage/
+*.gcda
+*.gcno
+
+# Secrets / env
+.env
+*.pem
+*.key
+
+# Large files you don't want in repo
+*.zip
+*.tar.gz
+*.7z
