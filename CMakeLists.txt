@@ -40,6 +40,12 @@ target_link_libraries(metricmq-broker PRIVATE metricmq_lib)
 add_executable(simple_pub_sub examples/pubsub_raw_tcp.cpp)
 target_link_libraries(simple_pub_sub PRIVATE metricmq_lib)
 
+add_executable(pub_only examples/pub_only.cpp)
+target_link_libraries(pub_only PRIVATE metricmq_lib)
+
+add_executable(sub_only examples/sub_only.cpp)
+target_link_libraries(sub_only PRIVATE metricmq_lib)
+
 add_executable(pubsub_redis examples/pubsub_redis.cpp)
 target_link_libraries(pubsub_redis PRIVATE metricmq_lib)
 
