@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <functional>
+#include <map>
 
 namespace metricmq {
 
@@ -28,6 +29,12 @@ public:
 
 private:
     int sock_ = -1;
+    
+    // Exactly-once: Track last processed sequence per topic
+    std::map<std::string, uint64_t> last_seq_;
+    
+    // Helper to send ACK
+    void sendAck(uint64_t sequence);
 };
 
 } // namespace metricmq

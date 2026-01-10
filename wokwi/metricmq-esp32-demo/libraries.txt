@@ -1,0 +1,9 @@
+{
+  "name": "metricmq-esp32-demo",
+  "version": "1.0.0",
+  "description": "MetricMQ ESP32 Wokwi Simulation - DHT22 Sensor Demo",
+  "main": "sketch.ino",
+  "dependencies": {
+    "DHTesp": "^1.18.0"
+  }
+}

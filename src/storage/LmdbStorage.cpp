@@ -1,94 +1,146 @@
-// src/storage/LmdbStorage.cpp (Recommended Version)
-#include "metricmq/storage/LmdbStorage.hpp"
+// src/storage/LmdbStorage.cpp
+#include "LmdbStorage.hpp"
 #include <iostream>
 #include <cstring>
-#include <chrono>
+#include <stdexcept>
 
-namespace metricmq {
+namespace metricmq::storage {
 
-LmdbStorage::LmdbStorage(const std::string& db_path) {
-    mdb_env_create(&env_);
+LmdbStorage::LmdbStorage(const std::string& db_path) : env_(nullptr), dbi_(0) {
+    int rc = mdb_env_create(&env_);
+    if (rc != 0) {
+        throw std::runtime_error("Failed to create LMDB environment");
+    }
+
     mdb_env_set_maxdbs(env_, 1);
     mdb_env_set_mapsize(env_, 10485760); // 10MB initial size
-    mdb_env_open(env_, db_path.c_str(), MDB_NOSUBDIR | MDB_WRITEMAP, 0664);
 
-    MDB_txn* txn;
-    mdb_txn_begin(env_, nullptr, 0, &txn);
-    mdb_dbi_open(txn, nullptr, MDB_CREATE, &dbi_);
+    rc = mdb_env_open(env_, db_path.c_str(), MDB_NOSUBDIR | MDB_WRITEMAP, 0664);
+    if (rc != 0) {
+        throw std::runtime_error("Failed to open LMDB environment");
+    }
+
+    MDB_txn* txn = nullptr;
+    rc = mdb_txn_begin(env_, nullptr, 0, &txn);
+    if (rc != 0) {
+        throw std::runtime_error("Failed to begin transaction");
+    }
+
+    rc = mdb_dbi_open(txn, nullptr, MDB_CREATE, &dbi_);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        throw std::runtime_error("Failed to open database");
+    }
+
     mdb_txn_commit(txn);
 }
 
 LmdbStorage::~LmdbStorage() {
-    if (env_) mdb_env_close(env_);
+    if (env_) {
+        mdb_env_close(env_);
+    }
 }
 
-uint64_t LmdbStorage::save(const std::string& topic, const std::string& payload) {
-    MDB_txn* txn;
-    mdb_txn_begin(env_, nullptr, 0, &txn);
+void LmdbStorage::save(uint64_t seq, const std::string& topic, const std::string& payload) {
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(env_, nullptr, 0, &txn);
+    if (rc != 0) {
+        std::cerr << "Failed to begin transaction\n";
+        return;
+    }
 
     // Get next sequence ID (stored under key "last_seq")
     MDB_val key, val;
     std::string last_key = "last_seq";
-    key.mv_data = last_key.data();
+    key.mv_data = (void*)last_key.data();
     key.mv_size = last_key.size();
 
-    uint64_t seq_id = 0;
+    uint64_t next_seq = 1;
     if (mdb_get(txn, dbi_, &key, &val) == 0) {
-        std::memcpy(&seq_id, val.mv_data, sizeof(seq_id));
+        if (val.mv_size == sizeof(uint64_t)) {
+            std::memcpy(&next_seq, val.mv_data, sizeof(uint64_t));
+            next_seq++;
+        }
     }
-    seq_id++;
 
-    // Save message
-    std::string msg_key = "msg:" + std::to_string(seq_id);
-    std::string msg_data = topic + "\0" + payload; // null separator
+    // Create message key: "msg:<seq>"
+    std::string msg_key = "msg:" + std::to_string(next_seq);
+    std::string msg_data = topic + "\x00" + payload; // null separator
 
     MDB_val msg_k, msg_v;
-    msg_k.mv_data = msg_key.data();
+    msg_k.mv_data = (void*)msg_key.data();
     msg_k.mv_size = msg_key.size();
-    msg_v.mv_data = msg_data.data();
+    msg_v.mv_data = (void*)msg_data.data();
     msg_v.mv_size = msg_data.size();
 
-    mdb_put(txn, dbi_, &msg_k, &msg_v, 0);
+    rc = mdb_put(txn, dbi_, &msg_k, &msg_v, 0);
+    if (rc != 0) {
+        std::cerr << "Failed to put message: " << mdb_strerror(rc) << "\n";
+        mdb_txn_abort(txn);
+        return;
+    }
 
-    // Update last seq
-    val.mv_data = &seq_id;
-    val.mv_size = sizeof(seq_id);
-    mdb_put(txn, dbi_, &key, &val, 0);
+    // Update last sequence ID
+    val.mv_data = &next_seq;
+    val.mv_size = sizeof(uint64_t);
+    rc = mdb_put(txn, dbi_, &key, &val, 0);
+    if (rc != 0) {
+        std::cerr << "Failed to update last_seq: " << mdb_strerror(rc) << "\n";
+        mdb_txn_abort(txn);
+        return;
+    }
 
     mdb_txn_commit(txn);
-
-    return seq_id;
 }
 
-std::vector<StoredMessage> LmdbStorage::get_after(uint64_t seq_id) {
-    std::vector<StoredMessage> messages;
+std::vector<std::tuple<uint64_t, std::string, std::string>> LmdbStorage::load_range(uint64_t from, uint64_t to) {
+    std::vector<std::tuple<uint64_t, std::string, std::string>> messages;
 
-    MDB_txn* txn;
-    mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn);
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        std::cerr << "Failed to begin read transaction\n";
+        return messages;
+    }
 
-    MDB_cursor* cursor;
-    mdb_cursor_open(txn, dbi_, &cursor);
+    MDB_cursor* cursor = nullptr;
+    rc = mdb_cursor_open(txn, dbi_, &cursor);
+    if (rc != 0) {
+        std::cerr << "Failed to open cursor\n";
+        mdb_txn_abort(txn);
+        return messages;
+    }
 
     MDB_val key, val;
-    std::string start_key = "msg:" + std::to_string(seq_id + 1);
-    key.mv_data = start_key.data();
+    std::string start_key = "msg:" + std::to_string(from);
+    key.mv_data = (void*)start_key.data();
     key.mv_size = start_key.size();
 
-    while (mdb_cursor_get(cursor, &key, &val, MDB_NEXT) == 0) {
-        if (std::strncmp(static_cast<char*>(key.mv_data), "msg:", 4) != 0) continue;
+    // Start from the computed key
+    int cursor_rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+    
+    while (cursor_rc == 0) {
+        // Check if this is a message key
+        std::string key_str(static_cast<char*>(key.mv_data), key.mv_size);
+        if (key_str.substr(0, 4) != "msg:") {
+            cursor_rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+            continue;
+        }
 
+        // Parse the sequence ID from key
+        uint64_t seq_id = std::stoull(key_str.substr(4));
+        if (seq_id > to) break;
+
+        // Parse message data (topic\0payload)
         std::string data(static_cast<char*>(val.mv_data), val.mv_size);
         size_t sep = data.find('\0');
-        if (sep == std::string::npos) continue;
+        if (sep != std::string::npos) {
+            std::string topic = data.substr(0, sep);
+            std::string payload = data.substr(sep + 1);
+            messages.emplace_back(seq_id, topic, payload);
+        }
 
-        StoredMessage msg;
-        msg.seq_id = std::stoull(std::string(static_cast<char*>(key.mv_data) + 4, key.mv_size - 4));
-        msg.topic = data.substr(0, sep);
-        msg.payload = data.substr(sep + 1);
-        msg.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-
-        messages.push_back(msg);
+        cursor_rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
     }
 
     mdb_cursor_close(cursor);
@@ -97,22 +149,106 @@ std::vector<StoredMessage> LmdbStorage::get_after(uint64_t seq_id) {
     return messages;
 }
 
-uint64_t LmdbStorage::get_last_seq_id() {
-    MDB_txn* txn;
-    mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn);
+uint64_t LmdbStorage::get_last_seq() const {
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        std::cerr << "Failed to begin read transaction\n";
+        return 0;
+    }
 
     MDB_val key, val;
     std::string last_key = "last_seq";
-    key.mv_data = last_key.data();
+    key.mv_data = (void*)last_key.data();
     key.mv_size = last_key.size();
 
     uint64_t seq = 0;
-    if (mdb_get(txn, dbi_, &key, &val) == 0) {
-        std::memcpy(&seq, val.mv_data, sizeof(seq));
+    if (mdb_get(txn, dbi_, &key, &val) == 0 && val.mv_size == sizeof(uint64_t)) {
+        std::memcpy(&seq, val.mv_data, sizeof(uint64_t));
     }
 
     mdb_txn_abort(txn);
     return seq;
 }
 
-} // namespace metricmq
+void LmdbStorage::save_ack(const std::string& client_id, uint64_t sequence) {
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(env_, nullptr, 0, &txn);
+    if (rc != 0) {
+        std::cerr << "Failed to begin transaction for ACK\n";
+        return;
+    }
+
+    // Create key: "ack:<client_id>:<sequence>"
+    std::string ack_key = "ack:" + client_id + ":" + std::to_string(sequence);
+    std::string ack_value = "1";  // Simple flag
+
+    MDB_val key, val;
+    key.mv_data = (void*)ack_key.data();
+    key.mv_size = ack_key.size();
+    val.mv_data = (void*)ack_value.data();
+    val.mv_size = ack_value.size();
+
+    rc = mdb_put(txn, dbi_, &key, &val, 0);
+    if (rc != 0) {
+        std::cerr << "Failed to save ACK: " << mdb_strerror(rc) << "\n";
+        mdb_txn_abort(txn);
+        return;
+    }
+
+    mdb_txn_commit(txn);
+}
+
+std::unordered_set<uint64_t> LmdbStorage::load_acks(const std::string& client_id) {
+    std::unordered_set<uint64_t> acks;
+
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        std::cerr << "Failed to begin read transaction for ACKs\n";
+        return acks;
+    }
+
+    MDB_cursor* cursor = nullptr;
+    rc = mdb_cursor_open(txn, dbi_, &cursor);
+    if (rc != 0) {
+        std::cerr << "Failed to open cursor for ACKs\n";
+        mdb_txn_abort(txn);
+        return acks;
+    }
+
+    // Scan for keys starting with "ack:<client_id>:"
+    std::string prefix = "ack:" + client_id + ":";
+    MDB_val key, val;
+    key.mv_data = (void*)prefix.data();
+    key.mv_size = prefix.size();
+
+    int cursor_rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+    
+    while (cursor_rc == 0) {
+        std::string key_str(static_cast<char*>(key.mv_data), key.mv_size);
+        
+        // Check if key starts with our prefix
+        if (key_str.substr(0, prefix.size()) != prefix) {
+            break;  // No more ACKs for this client
+        }
+
+        // Extract sequence ID from "ack:<client_id>:<seq>"
+        std::string seq_str = key_str.substr(prefix.size());
+        try {
+            uint64_t seq = std::stoull(seq_str);
+            acks.insert(seq);
+        } catch (...) {
+            // Skip malformed keys
+        }
+
+        cursor_rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    return acks;
+}
+
+} // namespace metricmq::storage

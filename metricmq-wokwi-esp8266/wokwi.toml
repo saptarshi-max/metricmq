@@ -1,0 +1,9 @@
+[wokwi]
+version = 1
+firmware = 'sketch.ino.hex'
+elf = 'sketch.ino.elf'
+
+[[net.forward]]
+# Forward MetricMQ broker port from localhost to Wokwi
+port = 6379
+host = "host.wokwi.internal"

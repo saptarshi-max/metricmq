@@ -1,5 +1,6 @@
-// src/pubsub.cpp
+// src/pubsub.cpp - RESP-based implementation
 #include "metricmq/pubsub.hpp"
+#include "resp_parser.hpp"
 #include <iostream>
 #include <cstring>
 
@@ -72,8 +73,19 @@ void Publisher::send(const std::string& topic, const std::string& payload) {
         return;
     }
 
-    std::string msg = topic + "|" + payload + "\n";
+    // Create RESP array: ["PUBLISH", topic, payload]
+    RespValue cmd = RespParser::makeArray({"PUBLISH", topic, payload});
+    std::string msg = RespParser::serialize(cmd);
+    
     ::send(sock_, msg.c_str(), static_cast<int>(msg.size()), 0);
+    
+    // Read response (integer: number of subscribers)
+    char buffer[1024];
+    int n = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+    if (n > 0) {
+        buffer[n] = '\0';
+        // Optional: parse response to verify delivery
+    }
 }
 
 // Subscriber
@@ -116,27 +128,49 @@ void Subscriber::subscribe(const std::string& topic,
         return;
     }
 
+    // Send SUBSCRIBE command via RESP
+    RespValue cmd = RespParser::makeArray({"SUBSCRIBE", topic});
+    std::string sub_msg = RespParser::serialize(cmd);
+    ::send(this->sock_, sub_msg.c_str(), static_cast<int>(sub_msg.size()), 0);
+
+    // Receive loop - parse RESP messages
+    std::string recv_buffer;
     char buffer[4096];
+    
     while (true) {
-        int n = recv(this->sock_, buffer, sizeof(buffer) - 1, 0);
+        int n = recv(this->sock_, buffer, sizeof(buffer), 0);
         if (n <= 0) {
             std::cerr << "Subscriber: connection closed\n";
             break;
         }
 
-        buffer[n] = '\0';
-        std::string line(buffer);
+        recv_buffer.append(buffer, n);
 
-        size_t pos = line.find('|');
-        if (pos != std::string::npos) {
-            std::string received_topic = line.substr(0, pos);
-            std::string payload = line.substr(pos + 1);
-            if (!payload.empty() && payload.back() == '\n') {
-                payload.pop_back();
+        // Parse RESP messages from buffer
+        while (!recv_buffer.empty()) {
+            auto result = RespParser::parse(recv_buffer);
+            if (!result) {
+                // Incomplete message, wait for more data
+                break;
             }
 
-            if (topic == "#" || received_topic == topic) {
-                callback(received_topic, payload);
+            auto [value, bytes_consumed] = *result;
+            recv_buffer.erase(0, bytes_consumed);
+
+            // Handle subscription confirmation and messages
+            if (value.isArray()) {
+                const auto& arr = value.asArray();
+                if (arr.size() >= 3) {
+                    std::string msg_type = arr[0].asString();
+                    
+                    if (msg_type == "message") {
+                        // Message format: ["message", topic, payload]
+                        std::string received_topic = arr[1].asString();
+                        std::string payload = arr[2].asString();
+                        callback(received_topic, payload);
+                    }
+                    // Ignore "subscribe" confirmations
+                }
             }
         }
     }
@@ -149,16 +183,38 @@ void Subscriber::run() {
     }
 
     std::cout << "Subscriber running (blocking receive loop)...\n";
+    
+    std::string recv_buffer;
     char buffer[4096];
+    
     while (true) {
-        int n = recv(this->sock_, buffer, sizeof(buffer) - 1, 0);
+        int n = recv(this->sock_, buffer, sizeof(buffer), 0);
         if (n <= 0) {
             std::cerr << "Subscriber: connection closed\n";
             break;
         }
-        buffer[n] = '\0';
-        std::cout << "Raw received: " << buffer << "\n";
+        
+        recv_buffer.append(buffer, n);
+        
+        while (!recv_buffer.empty()) {
+            auto result = RespParser::parse(recv_buffer);
+            if (!result) break;
+            
+            auto [value, bytes_consumed] = *result;
+            recv_buffer.erase(0, bytes_consumed);
+            
+            std::cout << "Raw RESP received: " << RespParser::serialize(value);
+        }
     }
+}
+
+void Subscriber::sendAck(uint64_t sequence) {
+    if (sock_ == -1) return;
+    
+    // Send ACK command: ["ACK", sequence]
+    RespValue cmd = RespParser::makeArray({"ACK", std::to_string(sequence)});
+    std::string ack_msg = RespParser::serialize(cmd);
+    ::send(sock_, ack_msg.c_str(), static_cast<int>(ack_msg.size()), 0);
 }
 
 } // namespace metricmq

@@ -1,38 +1,73 @@
 // src/main.cpp
-#include "metricmq/broker.hpp"
-#include "metricmq/client.hpp"
+#include "broker.hpp"
+#include "metricmq/logger.hpp"
+#include "metricmq/metrics_server.hpp"
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <csignal>
+
+// Global broker pointer for signal handler
+std::atomic<metricmq::Broker*> g_broker(nullptr);
+std::atomic<bool> g_shutdown_requested(false);
+
+void signal_handler(int signal) {
+    const char* signal_name = (signal == SIGINT) ? "SIGINT" : 
+                              (signal == SIGTERM) ? "SIGTERM" : "UNKNOWN";
+    
+    std::cout << "\n\n📛 Received signal " << signal_name << " (" << signal << ")\n";
+    
+    if (g_shutdown_requested) {
+        std::cout << "⚠️  Force quit (second signal)\n";
+        std::exit(1);
+    }
+    
+    g_shutdown_requested = true;
+    
+    // Trigger graceful shutdown
+    auto* broker = g_broker.load();
+    if (broker) {
+        broker->stop();
+    }
+}
 
 int main() {
-    std::cout << "=== MetricMQ Starting ===\n\n";
+    // Initialize logger first
+    metricmq::Logger::init("logs/metricmq.log", spdlog::level::debug);
+    
+    std::cout << "╔════════════════════════════════════════════╗\n";
+    std::cout << "║         MetricMQ Broker v1.0              ║\n";
+    std::cout << "║    Lightweight Message Queue for IoT      ║\n";
+    std::cout << "╚════════════════════════════════════════════╝\n\n";
 
-    // Start broker in background thread
-    metricmq::Broker broker(6379);
-    std::thread broker_thread([&broker] { broker.run(); });
+    // Install signal handlers
+    std::signal(SIGINT, signal_handler);   // Ctrl+C
+    std::signal(SIGTERM, signal_handler);  // Termination request
+    
+    std::cout << "📡 Starting broker on port 6379...\n";
+    std::cout << "� Starting metrics server on port 9091...\n";
+    std::cout << "💡 Press Ctrl+C for graceful shutdown\n\n";
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(500)); // give broker time to start
-
-    // Publisher example
-    metricmq::Publisher pub("127.0.0.1", 6379);
-    std::cout << "Publisher sending 5 messages...\n";
-    for (int i = 1; i <= 5; ++i) {
-        std::string msg = "Hello from publisher #" + std::to_string(i);
-        pub.send("demo", msg);
-        std::cout << "Sent: " << msg << "\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Start metrics server
+    metricmq::MetricsServer metrics_server(9091);
+    try {
+        metrics_server.start();
+    } catch (const std::exception& ex) {
+        std::cerr << "⚠️  Failed to start metrics server: " << ex.what() << "\n";
+        std::cerr << "   Continuing without metrics endpoint...\n";
     }
-
-    // Subscriber example (in main thread for simplicity)
-    std::cout << "\nStarting subscriber (press Ctrl+C to stop)...\n";
-    metricmq::Subscriber sub("127.0.0.1", 6379);
-    sub.subscribe("demo", [](const std::string& topic, const std::string& payload) {
-        (void)topic; // topic available if needed
-        std::cout << "Received: " << payload << "\n";
-    });
-    sub.run();  // blocking loop
-
-    broker_thread.join();
+    
+    // Start broker
+    metricmq::Broker broker(6379);
+    g_broker.store(&broker);
+    
+    // Run broker (blocks until shutdown)
+    broker.run();
+    
+    // Stop metrics server
+    metrics_server.stop();
+    
+    std::cout << "\n👋 MetricMQ broker stopped\n";
     return 0;
 }
