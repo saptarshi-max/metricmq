@@ -63,8 +63,10 @@ uint64_t BinaryProtocol::readUint64(const std::string& buffer, size_t offset) {
 }
 
 std::string BinaryProtocol::serialize(const BinaryFrame& frame) {
+    // Calculate size: base + topic + payload + optional signature (64B) + key_id (4B)
+    size_t extra_size = frame.is_signed ? (SIGNATURE_SIZE + KEY_ID_SIZE) : 0;
     std::string buffer;
-    buffer.reserve(MIN_FRAME_SIZE + frame.topic.size() + frame.payload.size());
+    buffer.reserve(MIN_FRAME_SIZE + frame.topic.size() + frame.payload.size() + extra_size);
 
     // Header: [Version: 1B][Command: 1B][Sequence: 8B][Topic Len: 2B][Payload Len: 4B]
     buffer.push_back(static_cast<char>(frame.version));
@@ -76,6 +78,12 @@ std::string BinaryProtocol::serialize(const BinaryFrame& frame) {
     // Variable-length data
     buffer.append(frame.topic);
     buffer.append(frame.payload);
+
+    // Append signature data for signed frames
+    if (frame.is_signed) {
+        buffer.append(reinterpret_cast<const char*>(frame.signature.data()), SIGNATURE_SIZE);
+        writeUint32(buffer, frame.key_id);
+    }
 
     return buffer;
 }
@@ -107,8 +115,13 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
     uint32_t payload_len = readUint32(buffer, offset);
     offset += 4;
 
+    // Check if this is a signed frame
+    bool is_signed_cmd = (frame.command == BinaryCommand::CMD_SIGNED_PUBLISH ||
+                          frame.command == BinaryCommand::CMD_SIGNED_MESSAGE);
+    size_t sig_size = is_signed_cmd ? (SIGNATURE_SIZE + KEY_ID_SIZE) : 0;
+
     // Check if we have complete frame
-    size_t total_size = MIN_FRAME_SIZE + topic_len + payload_len;
+    size_t total_size = MIN_FRAME_SIZE + topic_len + payload_len + sig_size;
     if (buffer.size() < total_size) {
         return std::nullopt;  // Incomplete frame
     }
@@ -122,6 +135,15 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
     if (payload_len > 0) {
         frame.payload = buffer.substr(offset, payload_len);
         offset += payload_len;
+    }
+
+    // Parse signature data for signed frames
+    if (is_signed_cmd) {
+        std::memcpy(frame.signature.data(), buffer.data() + offset, SIGNATURE_SIZE);
+        offset += SIGNATURE_SIZE;
+        frame.key_id = readUint32(buffer, offset);
+        offset += KEY_ID_SIZE;
+        frame.is_signed = true;
     }
 
     return std::make_pair(frame, total_size);

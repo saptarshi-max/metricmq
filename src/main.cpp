@@ -2,6 +2,7 @@
 #include "broker.hpp"
 #include "metricmq/logger.hpp"
 #include "metricmq/metrics_server.hpp"
+#include "metricmq/crypto.hpp"
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -35,6 +36,12 @@ void signal_handler(int signal) {
 int main() {
     // Initialize logger first
     metricmq::Logger::init("logs/metricmq.log", spdlog::level::debug);
+    
+    // Initialize crypto subsystem (libsodium)
+    if (!metricmq::crypto::init()) {
+        std::cerr << "Failed to initialize crypto subsystem\n";
+        return 1;
+    }
     
     std::cout << "╔════════════════════════════════════════════╗\n";
     std::cout << "║         MetricMQ Broker v1.0              ║\n";

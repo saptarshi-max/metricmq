@@ -1,6 +1,7 @@
 // Binary Protocol Pub/Sub Implementation
 #include "metricmq/binary_pubsub.hpp"
 #include "binary_protocol.hpp"
+#include "metricmq/crypto.hpp"
 #include <iostream>
 #include <cstring>
 
@@ -70,6 +71,49 @@ void BinaryPublisher::send(const std::string& topic, const std::string& payload)
         auto result = BinaryProtocol::parse(ack_buffer);
         if (result && result->first.command == BinaryCommand::CMD_ACK) {
             // ACK received successfully
+        }
+    }
+}
+
+void BinaryPublisher::setSigningKey(const std::array<uint8_t, 64>& secret_key, uint32_t key_id) {
+    secret_key_ = secret_key;
+    signing_key_id_ = key_id;
+    signing_enabled_ = true;
+}
+
+void BinaryPublisher::sendSigned(const std::string& topic, const std::string& payload) {
+    if (sock_ == -1) {
+        std::cerr << "BinaryPublisher: not connected\n";
+        return;
+    }
+    if (!signing_enabled_) {
+        std::cerr << "BinaryPublisher: signing not configured (call setSigningKey first)\n";
+        return;
+    }
+
+    // Sign: message = topic + payload (matches broker verification in session.cpp)
+    std::string message_to_sign = topic + payload;
+    auto signature = crypto::sign(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message_to_sign.data()),
+                                 message_to_sign.size()),
+        secret_key_
+    );
+
+    // Build signed frame
+    BinaryFrame frame = BinaryFrame::signed_publish(topic, payload, signature, signing_key_id_, ++sequence_);
+    std::string data = BinaryProtocol::serialize(frame);
+    ::send(sock_, data.c_str(), static_cast<int>(data.size()), 0);
+
+    // Read ACK or ERROR
+    char buffer[256];
+    int n = recv(sock_, buffer, sizeof(buffer), 0);
+    if (n > 0) {
+        std::string ack_buffer(buffer, n);
+        auto result = BinaryProtocol::parse(ack_buffer);
+        if (result) {
+            if (result->first.command == BinaryCommand::CMD_ERROR) {
+                std::cerr << "BinaryPublisher: signed publish REJECTED: " << result->first.payload << "\n";
+            }
         }
     }
 }
@@ -188,9 +232,10 @@ void BinarySubscriber::subscribe(const std::string& topic,
             auto [frame, bytes_consumed] = *result;
             recv_buffer.erase(0, bytes_consumed);
 
-            // Handle MESSAGE frames
-            if (frame.command == BinaryCommand::CMD_MESSAGE) {
-                // Call user callback
+            // Handle MESSAGE and SIGNED_MESSAGE frames
+            if (frame.command == BinaryCommand::CMD_MESSAGE ||
+                frame.command == BinaryCommand::CMD_SIGNED_MESSAGE) {
+                // Call user callback (basic callback ignores signature metadata)
                 callback(frame.topic, frame.payload);
                 
                 // Send ACK if enabled
@@ -204,6 +249,71 @@ void BinarySubscriber::subscribe(const std::string& topic,
                     std::cout << " (client: " << client_id_ << ")";
                 }
                 std::cout << "\n";
+            }
+        }
+    }
+}
+
+void BinarySubscriber::subscribeSigned(const std::string& topic,
+                                       std::function<void(const SignedMessageInfo& msg)> callback,
+                                       bool auto_ack) {
+    if (sock_ == -1) {
+        std::cerr << "BinarySubscriber: not connected\n";
+        return;
+    }
+
+    auto_ack_ = auto_ack;
+
+    // Send SUBSCRIBE frame with optional client ID
+    std::string subscribe_topic = topic;
+    if (!client_id_.empty()) {
+        subscribe_topic = client_id_ + std::string(1, '\0') + topic;
+    }
+
+    BinaryFrame frame = BinaryFrame::subscribe(subscribe_topic, ++sequence_);
+    std::string data = BinaryProtocol::serialize(frame);
+    ::send(sock_, data.c_str(), static_cast<int>(data.size()), 0);
+
+    // Receive loop
+    std::string recv_buffer;
+    char buffer[4096];
+
+    while (true) {
+        int n = recv(sock_, buffer, sizeof(buffer), 0);
+        if (n <= 0) {
+            std::cerr << "BinarySubscriber: connection closed\n";
+            break;
+        }
+
+        recv_buffer.append(buffer, n);
+
+        while (!recv_buffer.empty()) {
+            auto result = BinaryProtocol::parse(recv_buffer);
+            if (!result) break;
+
+            auto [frame, bytes_consumed] = *result;
+            recv_buffer.erase(0, bytes_consumed);
+
+            if (frame.command == BinaryCommand::CMD_MESSAGE ||
+                frame.command == BinaryCommand::CMD_SIGNED_MESSAGE) {
+                
+                SignedMessageInfo info;
+                info.topic = frame.topic;
+                info.payload = frame.payload;
+                info.sequence = frame.sequence;
+                info.is_signed = frame.is_signed;
+                info.key_id = frame.key_id;
+                if (frame.is_signed) {
+                    info.signature = frame.signature;
+                }
+
+                callback(info);
+
+                if (auto_ack_) {
+                    sendAck(frame.sequence);
+                }
+            } else if (frame.command == BinaryCommand::CMD_ACK) {
+                std::cout << "BinarySubscriber: Subscribed to '" << topic << "'\n";
             }
         }
     }

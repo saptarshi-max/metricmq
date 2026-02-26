@@ -18,6 +18,7 @@
 #include "resp_parser.hpp"
 #include "binary_protocol.hpp"
 #include "metricmq/logger.hpp"
+#include "metricmq/crypto.hpp"
 #include <iostream>
 #include <string>
 #include <memory>
@@ -155,6 +156,14 @@ void Session::handleBinaryFrame(const BinaryFrame& frame) {
         }
 
         case BinaryCommand::CMD_PUBLISH: {
+            // Check if topic requires signature (secure/ prefix)
+            if (frame.topic.starts_with("secure/")) {
+                sendBinary(BinaryFrame::error("Topic '" + frame.topic + "' requires signed publish (CMD_SIGNED_PUBLISH)"));
+                std::cout << "REJECTED unsigned publish to secure topic: " << frame.topic << "\n";
+                LOG_WARN("Rejected unsigned publish to secure topic '{}' from fd={}", frame.topic, sock_fd_);
+                break;
+            }
+
             // Create MESSAGE frame for subscribers
             BinaryFrame msg = BinaryFrame::message(frame.topic, frame.payload, ++sequence_);
             std::string serialized = BinaryProtocol::serialize(msg);
@@ -178,6 +187,80 @@ void Session::handleBinaryFrame(const BinaryFrame& frame) {
             }
             break;
         }
+
+        case BinaryCommand::CMD_SIGNED_PUBLISH: {
+            // Verify signature before publishing
+            auto& keystore = crypto::get_global_keystore();
+            
+            // Build message to verify: topic + payload
+            std::string message_to_verify = frame.topic + frame.payload;
+            
+            // Verify using stored public key
+            bool valid = keystore.verify_with_key(
+                frame.key_id,
+                std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(message_to_verify.data()),
+                    message_to_verify.size()
+                ),
+                frame.signature
+            );
+            
+            if (!valid) {
+                sendBinary(BinaryFrame::error("Invalid signature or unknown key"));
+                std::cout << "REJECTED signed publish: invalid signature (key_id=" 
+                          << frame.key_id << ")\n";
+                LOG_WARN("Rejected signed publish: invalid signature key_id={} topic='{}' fd={}",
+                         frame.key_id, frame.topic, sock_fd_);
+                break;
+            }
+            
+            // Check topic-scope authorization
+            auto key_info = keystore.get_key_info(frame.key_id);
+            if (key_info && !key_info->allowed_topics.empty()) {
+                // allowed_topics can be a pattern like "sensors/*" or exact like "secure/data"
+                const std::string& allowed = key_info->allowed_topics;
+                bool topic_ok = false;
+                
+                if (allowed == "*" || allowed == "#") {
+                    topic_ok = true;  // Wildcard: all topics
+                } else if (allowed.size() >= 2 && allowed.back() == '*') {
+                    // Prefix match: "sensors/*" matches "sensors/temp", "sensors/hum", etc.
+                    std::string prefix = allowed.substr(0, allowed.size() - 1);
+                    topic_ok = frame.topic.starts_with(prefix);
+                } else {
+                    topic_ok = (frame.topic == allowed);  // Exact match
+                }
+                
+                if (!topic_ok) {
+                    sendBinary(BinaryFrame::error("Key not authorized for topic '" + frame.topic + "'"));
+                    std::cout << "REJECTED signed publish: key_id=" << frame.key_id
+                              << " not authorized for topic '" << frame.topic << "'"
+                              << " (allowed: '" << allowed << "')\n";
+                    LOG_WARN("Rejected signed publish: key_id={} not authorized for topic '{}' (allowed: '{}')",
+                             frame.key_id, frame.topic, allowed);
+                    break;
+                }
+            }
+            
+            // Signature valid + topic authorized - create SIGNED_MESSAGE for subscribers
+            BinaryFrame msg = BinaryFrame::signed_message(
+                frame.topic, frame.payload, frame.signature, frame.key_id, ++sequence_
+            );
+            std::string serialized = BinaryProtocol::serialize(msg);
+            broker_->publish(frame.topic, serialized);
+            
+            // Send ACK to publisher
+            sendBinary(BinaryFrame::ack(frame.sequence));
+            std::cout << "VERIFIED signed publish: " << frame.topic 
+                      << " (key_id=" << frame.key_id << ")\n";
+            LOG_INFO("Verified signed publish: topic='{}' key_id={} fd={}", 
+                     frame.topic, frame.key_id, sock_fd_);
+            break;
+        }
+
+        case BinaryCommand::CMD_SIGNED_MESSAGE:
+            // This is broker->client only, ignore if received
+            break;
 
         default:
             sendBinary(BinaryFrame::error("Unknown command"));
