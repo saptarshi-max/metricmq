@@ -1068,11 +1068,6 @@ persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
 | Benchmark topic mismatch (was Low) | `BM_SingleSubscriber_Throughput` publisher now uses `bench/sub_throughput`, matching the subscriber. |
 | No `ctest` integration (was Low) | `enable_testing()` + `add_test()` in CMakeLists.txt; unit tests: `ctest -LE requires_broker`. |
 
-| Issue | Resolution |
-|---|---|
-| Unbounded `client_acks_` sets (was Critical) | Replaced with `BoundedAckSet` — deque+hash set, MAX=10,000 entries, FIFO eviction. Fixed RAM per client ≈640 KB. |
-| LMDB grows unboundedly on disk (was Critical) | `LmdbStorage::compact()` + `purge_old_acks()` run every 1,000 publishes, keeping the last 100,000 messages. |
-
 ---
 
 *Last updated: 2026-03-13*
