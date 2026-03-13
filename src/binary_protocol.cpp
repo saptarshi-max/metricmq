@@ -99,10 +99,11 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
 
     // Parse header
     frame.version = static_cast<uint8_t>(buffer[offset++]);
-    
-    // Version check
+
+    // Version mismatch: return nullopt so the session drops this frame gracefully
+    // instead of throwing, which would crash the entire broker via std::terminate().
     if (frame.version != BINARY_PROTOCOL_VERSION) {
-        throw std::runtime_error("Unsupported protocol version: " + std::to_string(frame.version));
+        return std::nullopt;
     }
 
     frame.command = static_cast<BinaryCommand>(buffer[offset++]);
@@ -115,6 +116,17 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
     uint32_t payload_len = readUint32(buffer, offset);
     offset += 4;
 
+    // Enforce hard limits before computing total_size.
+    // Without these checks a malicious client can claim a 4 GB payload_len and
+    // cause the session to accumulate gigabytes in recv_buffer_ waiting for data
+    // that will never arrive, exhausting broker RAM.
+    if (topic_len > MAX_TOPIC_LEN) {
+        return std::nullopt;  // Session will hit MAX_RECV_BUFFER limit and disconnect
+    }
+    if (payload_len > MAX_PAYLOAD_LEN) {
+        return std::nullopt;
+    }
+
     // Check if this is a signed frame
     bool is_signed_cmd = (frame.command == BinaryCommand::CMD_SIGNED_PUBLISH ||
                           frame.command == BinaryCommand::CMD_SIGNED_MESSAGE);
@@ -123,7 +135,7 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
     // Check if we have complete frame
     size_t total_size = MIN_FRAME_SIZE + topic_len + payload_len + sig_size;
     if (buffer.size() < total_size) {
-        return std::nullopt;  // Incomplete frame
+        return std::nullopt;  // Incomplete frame — wait for more data
     }
 
     // Parse variable-length data

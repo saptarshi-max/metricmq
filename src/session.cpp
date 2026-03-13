@@ -55,63 +55,84 @@ ProtocolType Session::detectProtocol(const std::string& buffer) {
     return ProtocolType::UNKNOWN;
 }
 
+// Maximum size of the per-session receive buffer (16 MB).
+// A client claiming a payload larger than this is either buggy or malicious.
+// The connection is dropped rather than allocating unbounded memory.
+static constexpr size_t MAX_RECV_BUFFER = 16 * 1024 * 1024;
+
 void Session::run() {
     char buffer[4096];
-    while (true) {
-        int n = recv(sock_fd_, buffer, sizeof(buffer), 0);
-        if (n < 0) {
-            std::cerr << "Recv error\n";
-            break;
-        }
-        if (n == 0) {
-            break;  // connection closed gracefully
-        }
+    try {
+        while (true) {
+            int n = recv(sock_fd_, buffer, sizeof(buffer), 0);
+            if (n < 0) {
+                LOG_WARN("Recv error on fd={}: {}", sock_fd_, errno);
+                break;
+            }
+            if (n == 0) {
+                break;  // connection closed gracefully
+            }
 
-        // Append to receive buffer
-        recv_buffer_.append(buffer, n);
+            // Guard against unbounded buffer growth (OOM / slow-loris style attack).
+            // If a client has been trickling data without completing valid frames,
+            // drop the connection once the staging buffer exceeds the limit.
+            if (recv_buffer_.size() + static_cast<size_t>(n) > MAX_RECV_BUFFER) {
+                LOG_WARN("recv_buffer_ exceeded {} bytes on fd={} — dropping connection",
+                         MAX_RECV_BUFFER, sock_fd_);
+                sendBinary(BinaryFrame::error("Message too large — connection closed"));
+                break;
+            }
 
-        // Auto-detect protocol on first message
-        if (protocol_type_ == ProtocolType::UNKNOWN) {
-            protocol_type_ = detectProtocol(recv_buffer_);
+            // Append to receive buffer
+            recv_buffer_.append(buffer, n);
+
+            // Auto-detect protocol on first message
             if (protocol_type_ == ProtocolType::UNKNOWN) {
-                std::cerr << "Unable to detect protocol\n";
-                continue;
+                protocol_type_ = detectProtocol(recv_buffer_);
+                if (protocol_type_ == ProtocolType::UNKNOWN) {
+                    LOG_WARN("Unable to detect protocol on fd={}", sock_fd_);
+                    continue;
+                }
+                LOG_INFO("Protocol detected: {} (fd={})",
+                         protocol_type_ == ProtocolType::RESP ? "RESP" : "Binary", sock_fd_);
             }
-            std::cout << "Protocol detected: " 
-                     << (protocol_type_ == ProtocolType::RESP ? "RESP" : "Binary") << "\n";
+
+            // Parse messages based on protocol
+            if (protocol_type_ == ProtocolType::RESP) {
+                while (!recv_buffer_.empty()) {
+                    auto result = RespParser::parse(recv_buffer_);
+                    if (!result) break;
+
+                    auto [value, bytes_consumed] = *result;
+                    recv_buffer_.erase(0, bytes_consumed);
+                    handleCommand(value);
+                }
+            } else if (protocol_type_ == ProtocolType::BINARY) {
+                while (!recv_buffer_.empty()) {
+                    auto result = BinaryProtocol::parse(recv_buffer_);
+                    if (!result) break;
+
+                    auto [frame, bytes_consumed] = *result;
+                    recv_buffer_.erase(0, bytes_consumed);
+                    handleBinaryFrame(frame);
+                }
+            }
         }
-
-        // Parse messages based on protocol
-        if (protocol_type_ == ProtocolType::RESP) {
-            while (!recv_buffer_.empty()) {
-                auto result = RespParser::parse(recv_buffer_);
-                if (!result) break;
-
-                auto [value, bytes_consumed] = *result;
-                recv_buffer_.erase(0, bytes_consumed);
-                handleCommand(value);
-            }
-        } else if (protocol_type_ == ProtocolType::BINARY) {
-            while (!recv_buffer_.empty()) {
-                auto result = BinaryProtocol::parse(recv_buffer_);
-                if (!result) break;
-
-                auto [frame, bytes_consumed] = *result;
-                recv_buffer_.erase(0, bytes_consumed);
-                handleBinaryFrame(frame);
-            }
-        }
+    } catch (const std::exception& e) {
+        // Parsers or handlers threw — log it and let the session exit cleanly.
+        // Without this catch the entire broker process would be terminated via
+        // std::terminate() because this runs in a detached thread.
+        LOG_ERROR("Session fd={} threw exception: {} — closing connection", sock_fd_, e.what());
+    } catch (...) {
+        LOG_ERROR("Session fd={} threw unknown exception — closing connection", sock_fd_);
     }
 
-    std::cout << "Client disconnected: " << sock_fd_;
-    LOG_INFO("Client disconnected: fd={}{}", sock_fd_, 
+    LOG_INFO("Client disconnected: fd={}{}", sock_fd_,
              client_id_.empty() ? "" : " client_id=" + client_id_);
     if (!client_id_.empty()) {
-        std::cout << " (client: " << client_id_ << ")";
         broker_->unregisterClient(client_id_);
     }
-    std::cout << "\n";
-    
+
     broker_->removeSession(this);
     close_socket(sock_fd_);
 }

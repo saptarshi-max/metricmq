@@ -160,6 +160,10 @@ public:
     // Get minimum frame size (header only)
     static constexpr size_t MIN_FRAME_SIZE = 16;
 
+    // Hard limits to prevent OOM from malformed frames
+    static constexpr uint16_t MAX_TOPIC_LEN   = 256;
+    static constexpr uint32_t MAX_PAYLOAD_LEN = 16 * 1024 * 1024;  // 16 MB
+
     // Calculate total frame size for a given topic/payload
     static size_t calculateFrameSize(const std::string& topic, const std::string& payload) {
         return MIN_FRAME_SIZE + topic.size() + payload.size();

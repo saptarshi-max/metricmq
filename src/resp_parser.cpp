@@ -37,61 +37,77 @@ std::optional<std::pair<RespValue, size_t>> RespParser::parse(const std::string&
         case ':': { // Integer
             auto crlf = findCRLF(buffer, pos);
             if (!crlf) return std::nullopt;
-            
+
             std::string num_str = buffer.substr(pos, *crlf - pos);
-            int64_t num = std::stoll(num_str);
+            int64_t num;
+            try { num = std::stoll(num_str); }
+            catch (...) { return std::nullopt; }
             return std::make_pair(RespValue::integer(num), *crlf + 2);
         }
 
         case '$': { // Bulk String
+            static constexpr int64_t MAX_BULK_LEN = 16LL * 1024 * 1024;  // 16 MB
+
             auto crlf = findCRLF(buffer, pos);
             if (!crlf) return std::nullopt;
-            
+
             std::string len_str = buffer.substr(pos, *crlf - pos);
-            int64_t len = std::stoll(len_str);
-            
+            int64_t len;
+            try { len = std::stoll(len_str); }
+            catch (...) { return std::nullopt; }
+
             if (len == -1) {
                 // Null bulk string
                 return std::make_pair(RespValue::null(), *crlf + 2);
             }
-            
+            if (len < 0 || len > MAX_BULK_LEN) {
+                return std::nullopt;  // Reject oversized or invalid lengths
+            }
+
             size_t data_start = *crlf + 2;
-            if (buffer.size() < data_start + len + 2) {
+            if (buffer.size() < data_start + static_cast<size_t>(len) + 2) {
                 return std::nullopt; // incomplete
             }
-            
-            std::string str = buffer.substr(data_start, len);
-            return std::make_pair(RespValue::bulkString(str), data_start + len + 2);
+
+            std::string str = buffer.substr(data_start, static_cast<size_t>(len));
+            return std::make_pair(RespValue::bulkString(str), data_start + static_cast<size_t>(len) + 2);
         }
 
         case '*': { // Array
+            static constexpr int64_t MAX_ARRAY_COUNT = 10000;
+
             auto crlf = findCRLF(buffer, pos);
             if (!crlf) return std::nullopt;
-            
+
             std::string count_str = buffer.substr(pos, *crlf - pos);
-            int64_t count = std::stoll(count_str);
-            
+            int64_t count;
+            try { count = std::stoll(count_str); }
+            catch (...) { return std::nullopt; }
+
             if (count == -1) {
                 // Null array
                 return std::make_pair(RespValue::null(), *crlf + 2);
             }
-            
+            if (count < 0 || count > MAX_ARRAY_COUNT) {
+                return std::nullopt;  // Reject oversized or invalid array counts
+            }
+
             RespArray arr;
             size_t offset = *crlf + 2;
-            
+
             for (int64_t i = 0; i < count; ++i) {
                 auto elem = parse(buffer.substr(offset));
                 if (!elem) return std::nullopt; // incomplete
-                
+
                 arr.push_back(elem->first);
                 offset += elem->second;
             }
-            
+
             return std::make_pair(RespValue::array(arr), offset);
         }
 
         default:
-            throw std::runtime_error("Invalid RESP type: " + std::string(1, type_char));
+            return std::nullopt;  // Unknown type byte — drop frame, don't throw
     }
 }
 
