@@ -16,7 +16,7 @@
  * Map size: 1 GB  |  Flags: MDB_NOSUBDIR | MDB_WRITEMAP
  *
  * @par Thread safety
- * Not thread-safe — all calls must be serialized (by the broker mutex).
+ * Not thread-safe ï¿½ all calls must be serialized (by the broker mutex).
  */
 #pragma once
 #include <string>
@@ -96,6 +96,28 @@ public:
      * @return Set of all sequence IDs this client has acknowledged.
      */
     std::unordered_set<uint64_t> load_acks(const std::string& client_id);
+
+    /**
+     * @brief Delete old messages to keep LMDB below its size limit.
+     *
+     * Removes all `msg:<seq>` records where seq <= @p max_seq_to_delete.
+     * Call periodically (e.g. every 1 000 publishes) to prevent
+     * `MDB_MAP_FULL` crashes on long-running deployments.
+     *
+     * @param max_seq_to_delete Highest sequence number to purge (inclusive).
+     */
+    void compact(uint64_t max_seq_to_delete);
+
+    /**
+     * @brief Delete stale ACK records that are no longer needed.
+     *
+     * Removes all `ack:<client>:<seq>` records where seq <= @p max_seq_to_delete.
+     * Call with the same threshold as compact() so ACK records for compacted
+     * messages do not accumulate indefinitely.
+     *
+     * @param max_seq_to_delete Highest sequence number whose ACK records can be dropped.
+     */
+    void purge_old_acks(uint64_t max_seq_to_delete);
 
 private:
     MDB_env* env_; ///< LMDB environment handle.
