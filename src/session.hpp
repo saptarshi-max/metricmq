@@ -17,10 +17,11 @@
  *
  * @par Crash isolation
  * run() is wrapped in try/catch so an exception from one malformed frame
- * closes only this session — not the entire broker process.
+ * closes only this session ï¿½ not the entire broker process.
  */
 #pragma once
 #include <string>
+#include <chrono>
 
 namespace metricmq {
 
@@ -94,6 +95,18 @@ private:
     ProtocolType protocol_type_;  ///< Protocol detected for this connection.
     uint64_t     sequence_;       ///< Local sequence counter.
     std::string  client_id_;      ///< Client ID for exactly-once delivery tracking.
+
+    /// Timestamp of the last byte received on this connection.
+    /// Reset on every successful recv(). When now() - last_activity_ exceeds
+    /// SESSION_IDLE_TIMEOUT_S the connection is closed.
+    std::chrono::steady_clock::time_point last_activity_;
+
+    /// Idle threshold: connection closed after this many seconds with no data.
+    static constexpr int SESSION_IDLE_TIMEOUT_S = 300;  // 5 minutes
+
+    /// SO_RCVTIMEO interval: short enough to poll idle state, long enough not
+    /// to spin. recv() wakes up with a timeout error every RECV_TIMEOUT_S seconds.
+    static constexpr int RECV_TIMEOUT_S = 30;
 };
 
 } // namespace metricmq

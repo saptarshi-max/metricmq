@@ -5,12 +5,29 @@
 #define close_socket closesocket
 #define sleep_ms(ms) Sleep(ms)
 #define SOCKLEN_T int
+// On Windows, SO_RCVTIMEO takes a DWORD timeout in milliseconds.
+static inline void set_recv_timeout(int fd, int seconds) {
+    DWORD ms = static_cast<DWORD>(seconds) * 1000u;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+}
+static inline bool is_recv_timeout_error() {
+    int e = WSAGetLastError();
+    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
+}
 #else
 #include <unistd.h>
 #include <arpa/inet.h>
 #define close_socket close
 #define sleep_ms(ms) usleep(ms * 1000)
 #define SOCKLEN_T socklen_t
+// On POSIX, SO_RCVTIMEO takes a struct timeval.
+static inline void set_recv_timeout(int fd, int seconds) {
+    struct timeval tv{seconds, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+static inline bool is_recv_timeout_error() {
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
 #endif
 
 #include "session.hpp"
@@ -24,11 +41,13 @@
 #include <memory>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 
 namespace metricmq {
 
 Session::Session(int sock_fd, Broker* broker)
-    : sock_fd_(sock_fd), broker_(broker), protocol_type_(ProtocolType::UNKNOWN), sequence_(0) {
+    : sock_fd_(sock_fd), broker_(broker), protocol_type_(ProtocolType::UNKNOWN),
+      sequence_(0), last_activity_(std::chrono::steady_clock::now()) {
     LOG_DEBUG("Session created: fd={}", sock_fd);
     std::cout << "New client connected: " << sock_fd << "\n";
 }
@@ -61,17 +80,35 @@ ProtocolType Session::detectProtocol(const std::string& buffer) {
 static constexpr size_t MAX_RECV_BUFFER = 16 * 1024 * 1024;
 
 void Session::run() {
+    // Set a receive timeout so recv() wakes up periodically even when the
+    // client is silent. This lets us detect idle connections without a
+    // dedicated watchdog thread.
+    set_recv_timeout(sock_fd_, RECV_TIMEOUT_S);
+
     char buffer[4096];
     try {
         while (true) {
             int n = recv(sock_fd_, buffer, sizeof(buffer), 0);
             if (n < 0) {
+                if (is_recv_timeout_error()) {
+                    // recv() timed out — check how long we've been idle
+                    auto idle_s = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - last_activity_).count();
+                    if (idle_s >= SESSION_IDLE_TIMEOUT_S) {
+                        LOG_WARN("Session fd={} idle for {}s — closing zombie connection",
+                                 sock_fd_, idle_s);
+                        break;
+                    }
+                    continue;  // not idle long enough yet — keep waiting
+                }
                 LOG_WARN("Recv error on fd={}: {}", sock_fd_, errno);
                 break;
             }
             if (n == 0) {
                 break;  // connection closed gracefully
             }
+
+            last_activity_ = std::chrono::steady_clock::now();
 
             // Guard against unbounded buffer growth (OOM / slow-loris style attack).
             // If a client has been trickling data without completing valid frames,
