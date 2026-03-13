@@ -232,6 +232,7 @@ spdlog_*.txt
 # -----------------------------------------------------------------------------
 docs/_build/
 docs/html/
+docs/doxygen/
 docs/latex/
 Doxyfile.bak
 doxygen_sqlite3.db
