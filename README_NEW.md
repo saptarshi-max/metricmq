@@ -155,21 +155,23 @@ sequenceDiagram
 ### Internal Architecture Details
 
 **Session Handling (Multi-threaded):**
-- Each client connection runs in its own session thread
-- Per-session state: subscription list, sequence tracking, protocol type
-- Lock-free message passing via atomic operations
-- Auto-reconnect with exponential backoff
+- Each client connection runs in its own detached session thread
+- Per-session state: subscription list, sequence tracking, protocol type (RESP or Binary)
+- Broker state protected by a single global `std::mutex` (acquired on every publish, subscribe, ACK)
+- **No auto-reconnect** — clients must detect `!isConnected()` and call `connect()` manually
 
 **Topic Routing:**
-- Wildcard matching with two levels: `+` (single-level), `#` (multi-level)
-- Efficient trie-based topic tree for fast lookups
-- O(1) average case for exact topic matches
+- Exact-match routing plus a single `"#"` global wildcard (receives every message)
+- Internal store: `unordered_map<string, unordered_set<Session*>>`
+- O(1) average for exact topic lookups; `"#"` wildcard checked on every publish
 
-**Persistence Layer:**
-- Memory-mapped LMDB database
-- Sequential writes: 42.7K msg/s (1KB messages)
-- Random reads: 1.56M ops/s
-- Auto-compaction and B+ tree balancing
+**Persistence Layer (Phase 1 — LMDB with Compaction):**
+- Memory-mapped LMDB database (1 GB virtual map, `MDB_WRITEMAP`)
+- Sequential writes: 42.7K msg/s (1 KB messages); random reads: 1.56M ops/s
+- **Periodic compaction** — every 1,000 publishes, messages and ACK records older than
+  the last 100,000 sequence IDs are deleted, preventing `MDB_MAP_FULL` on long deployments
+- ACK tracking uses `BoundedAckSet` (deque + hash set, max 10,000 entries per client)
+  — fixed memory footprint regardless of broker uptime
 
 ---
 
@@ -821,37 +823,78 @@ LMDB Persistence (direct, no broker):
 MetricMQClient client;
 
 void setup() {
+    Serial.begin(115200);
     WiFi.begin("YourSSID", "YourPass");
     while (WiFi.status() != WL_CONNECTED) delay(500);
+
+    // Step 1: store broker address
     client.begin("192.168.1.100", 6379);
-    client.subscribe("commands", [](const String& topic, const String& payload) {
-        Serial.println(payload);
+    // Step 2: connect (optionally pass client_id for exactly-once replay)
+    client.connect("esp32-node-01");
+
+    client.subscribe("commands", [](const String& topic,
+                                    const uint8_t* payload, size_t len,
+                                    uint64_t seq) {
+        Serial.printf("cmd: %.*s\n", (int)len, payload);
     });
 }
 
 void loop() {
-    client.loop();
+    // IMPORTANT: auto-reconnect is NOT built-in — poll and reconnect manually
+    if (!client.isConnected()) {
+        Serial.println("[MetricMQ] Reconnecting...");
+        client.connect("esp32-node-01");
+    }
+
+    client.loop();  // drive keep-alive (60 s PING) and receive callbacks
+
     client.publish("sensors/temperature", String(readTemp(), 2));
     delay(5000);
 }
 ```
 
+> **Hard limits for ESP32 clients:**
+>
+> | Limit | Value | Notes |
+> |---|---|---|
+> | Max outbound frame | **1500 bytes** | topic + payload + 16-byte header; no fragmentation |
+> | Receive buffer | **2048 bytes** | Incoming frames larger than this are silently dropped |
+> | Max local verify keys | **4** (`MAX_VERIFY_KEYS`) | Keys for verifying incoming signed messages |
+> | Keep-alive PING interval | **60 seconds** | `keep_alive_ms_` in MetricMQ.cpp |
+> | Connection timeout | **180 seconds** | Three missed keep-alives |
+> | Auto-reconnect | **Not implemented** | Code calls `resetConnection()` and returns — your sketch must retry |
+
 ### Secure ESP32 Sketch
 
 ```cpp
 #include <MetricMQ.h>
-#include "crypto_secrets.h"  // Stores SECRET_KEY[64], key_id = 1
+#include "crypto_secrets.h"  // Stores SECRET_KEY[64], KEY_ID = 1
 
 MetricMQClient client;
 
 void setup() {
-    client.enableSigning(SECRET_KEY, 1);  // All publishes automatically signed
+    Serial.begin(115200);
+
+    // Must call setSigningKey BEFORE connect() so the subscribe frame is signed
+    client.setSigningKey(SECRET_KEY, KEY_ID);
+
     client.begin("192.168.1.100", 6379);
+    client.connect("esp32-secure-01");  // client_id enables exactly-once replay
+
+    // NOTE: outbound frame = 16 B header + topic + payload + 64 B sig + 4 B key_id
+    // Keep topic + payload under ~1416 bytes to stay within the 1500-byte frame limit
+    client.publishSigned("secure/sensors/data", "{\"temp\":25.5}");
 }
 
 void loop() {
+    // Poll and reconnect — auto-reconnect is NOT built-in
+    if (!client.isConnected()) {
+        Serial.println("[MetricMQ] Lost connection — reconnecting...");
+        client.connect("esp32-secure-01");
+    }
+
     client.loop();
-    client.publishSigned("secure/sensors/data", "{temp:25.5}");
+    client.publishSigned("secure/sensors/data", "{\"temp\":25.5}");
     delay(10000);
 }
 ```
@@ -961,10 +1004,64 @@ broker.run();   // Blocking; handles SIGINT for graceful shutdown
 
 - **Single global mutex** — all broker state is protected by one `std::mutex`.
   At >500 concurrent clients, lock contention becomes measurable.
-- **Unbounded ACK set** — `unordered_set<uint64_t>` per `client_id` grows forever.
-  No pruning or compaction is implemented. Will OOM on long-running producers.
-- **No message TTL / retention limit** — LMDB grows unboundedly on disk.
 - **Key registration requires a code edit + rebuild** — no runtime registration API.
+- **No session idle timeout** — zombie threads from crashed clients remain until broker restart.
+- **No RESP authentication** — any TCP client on port 6379 has full read/write access.
+- **Partial writes on `send()`** — `::send()` may return fewer bytes than requested; the remainder is silently dropped.
+
+> **Phase 1 (implemented):** The two highest-severity OOM risks have been addressed:
+> `BoundedAckSet` caps in-memory ACK tracking at 10,000 entries per client, and
+> LMDB compaction runs every 1,000 publishes to keep disk usage bounded (last 100K messages).
+
+---
+
+## Phase 1 — Memory Safety & Storage Compaction
+
+These changes ship on the `demo/esp32-security` branch and address the two highest-rated
+production risks from the original design.
+
+### BoundedAckSet (replaces unbounded `unordered_set`)
+
+**Before (OOM risk):** Each client's ACK history grew without limit. A device reconnecting
+after a long offline period could produce millions of ACK records, consuming hundreds of MB
+of broker RAM.
+
+**After:** `BoundedAckSet` (in `broker.hpp`) uses a circular-eviction strategy — a `deque`
+(insertion order) + `unordered_set` (O(1) lookup), capped at **10,000 entries per client**.
+Memory per client is fixed at ≈ 640 KB regardless of broker uptime.
+
+```
+RAM per client (worst case):
+  10,000 × (8 bytes seq + ~56 bytes unordered_set node) ≈ 640 KB
+  With 50 ESP32 devices: 50 × 640 KB = 32 MB — well within server limits
+```
+
+**ESP32 impact:** Devices can run continuously, publishing and ACK'ing indefinitely,
+without risking broker OOM. The broker evicts the oldest ACK records automatically.
+
+### LMDB Compaction (`compact` + `purge_old_acks`)
+
+**Before (MDB_MAP_FULL risk):** At 42,674 writes/s, the 1 GB LMDB map fills in ~6.5 hours
+of continuous publishing at 1 KB/message. Once full, `mdb_put()` silently fails and the
+broker stops persisting anything — undetected data loss.
+
+**After:** Two new methods in `LmdbStorage` run automatically every 1,000 publishes:
+
+| Method | What it deletes |
+|---|---|
+| `compact(threshold)` | All `msg:<seq>` records where seq ≤ `current_seq - 100,000` |
+| `purge_old_acks(threshold)` | All `ack:<client>:<seq>` records with the same threshold |
+
+This keeps LMDB bounded to the last **100,000 messages** on disk — far more than needed
+for a typical IoT backlog while preventing map saturation.
+
+**ESP32 impact:** A fleet of 50 devices publishing every second will no longer crash the
+broker after ~6 hours of uptime. Long-running overnight deployments are now safe.
+
+> **Replay window:** Because only the last 100,000 messages are kept, a device that has
+> been offline for more than `100,000 / publish_rate` seconds will miss some messages on
+> reconnect — they will have been compacted away. For typical IoT polling rates (1 Hz),
+> that is a >27-hour replay window per topic, which covers most real-world outage scenarios.
 
 ---
 
@@ -979,7 +1076,7 @@ broker.run();   // Blocking; handles SIGINT for graceful shutdown
 | `lmdb: permission denied` | Another process holds the DB lock | Kill existing broker; delete `metricmq.db-lock` |
 | Late subscriber misses messages | `BinarySubscriber` constructed without `client_id` | Always pass `client_id` for replay-offset tracking |
 | High latency spikes at >500 clients | Single global mutex contention | Expected — architectural limitation; open a PR |
-| ESP32 disconnects repeatedly | TCP timeout or `loop()` not called | Ensure `client.loop()` runs every iteration |
+| ESP32 disconnects repeatedly | TCP timeout or `loop()` not called, or auto-reconnect not implemented | Call `client.loop()` every iteration; poll `!isConnected()` and call `client.connect()` manually |
 
 ### Windows Firewall
 
@@ -1019,9 +1116,9 @@ High-impact areas for contributors:
 1. **Fix topic mismatch** in `BM_SingleSubscriber_Throughput` — publisher and subscriber use different topic strings
 2. **Add `ctest` integration** — wire up `enable_testing()` / `add_test()` for CI
 3. **Remove hardcoded Conan paths** from `CMakeLists.txt` — breaks every build outside the original dev machine
-4. **Implement ACK pruning** — `unordered_set<uint64_t>` per client grows forever; add compaction by `last_ack_seq_`
-5. **Canonicalize the signing format** — `crypto_demo.cpp` uses `topic + ":" + payload`; `signed_publish_test.cpp` uses `topic + payload`; pick one and document it
-6. **Add manual ACK tests** — `auto_ack=false` path is completely untested
+4. **Canonicalize the signing format** — `crypto_demo.cpp` uses `topic + ":" + payload`; `signed_publish_test.cpp` uses `topic + payload`; pick one and document it
+5. **Add manual ACK tests** — `auto_ack=false` path is completely untested
+6. **Add RESP authentication** — any TCP client on port 6379 has full access; a password challenge would help
 7. **Language bindings** — Python, Go, Rust, JavaScript clients
 8. **TLS/DTLS layer** — connection-level encryption (Ed25519 is message-level only)
 

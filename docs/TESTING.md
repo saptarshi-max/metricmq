@@ -560,7 +560,7 @@ while ($true) {
 | Subscriber receives 0 messages | No broker running, or topic mismatch | Start broker; check topic strings match exactly (case-sensitive) |
 | Subscriber receives duplicate messages | ACKs not persisted or not loaded on reconnect | Verify `client_id` is set; check LMDB ACK keys with `mdb_dump` |
 | Broker process dies | Uncaught exception in session thread | Check `logs/metricmq.log` for `"threw exception"` lines (fixed in session.cpp hardening) |
-| `MDB_MAP_FULL` errors | LMDB 1 GB limit hit | Delete `metricmq.db` and restart, or implement log compaction |
+| `MDB_MAP_FULL` errors | LMDB 1 GB limit hit — Phase 1 compaction (every 1,000 publishes) should prevent this on normal deployments | If you see this despite Phase 1, the broker has not published 1,000 messages yet since restart; trigger manually, or delete `metricmq.db` |
 | `bind() failed: errno=98` | Port 6379 in use | `netstat -ano | findstr 6379` to find the process |
 | Benchmark shows 0 msg/s | Wrong topic in subscriber | See known bug: `BM_SingleSubscriber_Throughput` subscribes to `bench/sub_throughput` but publishes to `bench/throughput` |
 
@@ -568,12 +568,19 @@ while ($true) {
 
 ## 9. Coverage Gaps & Known Limitations
 
+> **Phase 1 mitigations**: The ACK-set OOM and LMDB map-full risks documented here have been
+> addressed by `BoundedAckSet` (max 10,000 ACKs per client) and periodic LMDB compaction
+> (every 1,000 publishes, keeping the last 100,000 messages). The risks below describe
+> what is still unverified by automated tests.
+
 | Gap | Risk level | Notes |
 |-----|-----------|-------|
 | **No broker-restart test** | High | `persistence_test` does not stop/restart the broker. True durability is not automatically verified. |
 | **No ctest integration** | High | All tests are manual. CI cannot detect regressions. |
 | **exactly_once_test exits 0 on failure** | High | Can silently pass in CI. Parse stdout for `❌` to detect failures. |
 | **No concurrency / race condition test** | High | The broker has a global mutex and multiple data races (see TECHNICAL.md §13). No stress test exists. |
+| **No compaction validation test** | Medium | Phase 1 compaction runs, but no automated test verifies that deleted messages are truly gone and `get_last_seq()` is correct after compaction. |
+| **No BoundedAckSet eviction test** | Medium | The eviction path in `BoundedAckSet` (when `order_.size() >= MAX`) is not covered by any automated test. |
 | **No error-path tests** | Medium | Malformed frames, truncated payloads, binary frames with oversized headers — none are automatically tested. |
 | **No signed message rejection test** | Medium | The signing test verifies correct signatures. No test sends a garbled signature to the broker and checks for CMD_ERROR. |
 | **No topic sanitization test** | Medium | Topics with null bytes, path separators, or control characters are accepted; behavior is undefined. |
@@ -588,6 +595,12 @@ while ($true) {
 3. **Connection limit test:** Open 1001 connections and verify the 1001st is rejected gracefully.
 4. **Signed message rejection:** Send a frame with a corrupted 64-byte signature and verify CMD_ERROR is returned.
 5. **Topic overflow test:** Send a frame with topic length > 256 and verify it's dropped, not processed.
+6. **Compaction correctness test:** Publish 110,000 messages (exceeds `MAX_STORED_MESSAGES`), trigger compaction,
+   then verify that only the last 100,000 are reported by `load_range(0, UINT64_MAX)` and that `get_last_seq()`
+   equals 110,000. Confirm no `MDB_MAP_FULL` errors occur.
+7. **BoundedAckSet eviction test:** ACK 15,000 sequences from one client, then call `isAcked()` for sequences
+   1–5,000 (should all be evicted, return false) and 5,001–15,000 (should return true). Confirm broker RAM
+   does not grow after the cap is reached.
 
 ---
 

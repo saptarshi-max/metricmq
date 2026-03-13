@@ -47,7 +47,7 @@ MetricMQ is a single-process, multi-threaded message broker. Every accepted TCP 
                         │  ┌─────────────────────────────┐     │
                         │  │  Broker (shared, mutex lock) │     │
                         │  │  topic_subscribers_ map      │     │
-                        │  │  client_acks_ map            │     │
+                        │  │  client_acks_ (BoundedAckSet)│     │
                         │  │  current_sequence_ counter   │     │
                         │  └──────────────┬──────────────┘     │
                         │                 │                     │
@@ -629,7 +629,18 @@ db.save_ack(client_id, seq);
 // Load all ACKs for a reconnecting client
 auto acks = db.load_acks(client_id);
 // Returns: unordered_set<uint64_t>
+
+// Delete old messages (seq <= max_seq_to_delete)
+db.compact(max_seq_to_delete);
+
+// Delete stale ACK records (seq <= max_seq_to_delete)
+db.purge_old_acks(max_seq_to_delete);
 ```
+
+> **When compaction runs:** The broker's `publish()` increments `publish_count_` on every
+> message; every 1,000 publishes it calls `runCompactionIfDue()`, which passes
+> `current_sequence_ - MAX_STORED_MESSAGES` (100,000) as the threshold to both methods.
+> This keeps LMDB below ~100 MB for typical 1 KB messages.
 
 ### 7.3 LMDB Configuration
 
@@ -924,28 +935,50 @@ lib_deps =
 
 MetricMQClient client;
 
-// Connect
+// Step 1: Store broker address (does NOT connect yet)
 client.begin("192.168.1.100", 6379);
+
+// Step 2: Connect (optionally pass client_id for exactly-once replay)
+client.connect("esp32-sensor-01");          // identifies client; enables ACK replay on reconnect
+// OR: client.connect();                    // anonymous — no replay-offset tracking
 
 // Publish (unsigned)
 client.publish("sensors/temp", "22.5");
 
-// Publish (signed — requires key provisioning)
+// Publish (signed — requires setSigningKey BEFORE connect)
 uint8_t secret_key[64] = { /* ... from keygen tool ... */ };
 uint32_t key_id = 0x00000001;
 client.setSigningKey(secret_key, key_id);
-client.publishSigned("secure/temp", "22.5");
+client.publishSigned("secure/temp", "22.5");  // topic + payload must fit in 1500 B frame
 
 // Subscribe
-client.subscribe("commands", [](const char* payload) {
-    Serial.println(payload);
+client.subscribe("commands", [](const String& topic,
+                                const uint8_t* payload, size_t len,
+                                uint64_t seq) {
+    // Handle command
 });
 
-// Call in loop()
+// Call in loop() — drives keep-alive and receive handling
 void loop() {
-    client.update();   // processes incoming frames, fires callbacks
+    // Auto-reconnect is NOT built-in — poll isConnected() yourself
+    if (!client.isConnected()) {
+        client.connect("esp32-sensor-01");
+    }
+    client.loop();
 }
 ```
+
+**ESP32 Hard Limits:**
+
+| Limit | Value | Notes |
+|---|---|---|
+| Max outbound frame | **1500 bytes** | header(16) + topic + payload + sig(64) + keyId(4); no fragmentation |
+| Receive buffer | **2048 bytes** | `recv_buffer_[2048]` — frames larger than this are not parsed |
+| Max local verify keys | **4** (`MAX_VERIFY_KEYS`) | For verifying incoming `CMD_SIGNED_MESSAGE` frames |
+| Keep-alive PING interval | **60 seconds** | `keep_alive_ms_` default |
+| Connection timeout | **180 seconds** | Missing three keep-alives disconnects the client |
+| Auto-reconnect | **Not implemented** | `loop()` calls `resetConnection()` on timeout; your sketch must retry |
+| Client ID source | Defaults to empty | Call `setClientId()` or pass to `connect(clientId)` before connecting |
 
 ### 12.3 Key Provisioning Workflow
 
@@ -967,9 +1000,38 @@ void loop() {
 | libsodium (ESP32 built-in) | ~40 KB | ~2 KB |
 | Total overhead | ~44 KB | ~3 KB |
 
+### 12.5 Broker Stability for Embedded Deployments
+
+Before Phase 1, two broker-side issues could silently degrade or crash the system when running
+with a fleet of ESP32 devices over days or weeks:
+
+**ACK memory growth:** Every `CMD_ACK` from any device would insert into an unbounded hash set.
+A device publishing and ACK'ing once per second for 30 days would generate ~2.6 million ACK
+records for that client alone. With 50 devices, the broker could accumulate **130 million**
+ACK entries before the first restart.
+
+**After Phase 1:** `BoundedAckSet` caps this at 10,000 entries per client (FIFO eviction).
+Memory per device is bounded at ~640 KB regardless of uptime.
+
+**LMDB saturation:** At 1 KB/message with one publish per second across 50 devices,
+`metricmq.db` would hit 1 GB in ~5.7 hours. After that, `mdb_put()` returns `MDB_MAP_FULL`,
+persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
+
+**After Phase 1:** `compact()` deletes messages older than the last 100,000 sequence IDs;
+`purge_old_acks()` deletes corresponding ACK records. Both run every 1,000 publishes.
+
+**Replay window for embedded devices:**
+- 100,000 messages across 50 devices at 1 Hz = 2,000 seconds ≈ **33 minutes** per device
+- At 0.1 Hz (polling every 10 s): **333 minutes → 5.5 hours** before messages age out
+- For longer outages, increase `MAX_STORED_MESSAGES` in `broker.hpp` (default: 100,000)
+
 ---
 
 ## 13. Architectural Limitations & Known Issues
+
+> **Phase 1 status:** The two previously Critical OOM issues — unbounded ACK sets and LMDB
+> map saturation — have been resolved. See §7.2 for the compaction API and `BoundedAckSet`
+> in `broker.hpp` for the bounded ACK tracking implementation.
 
 ### Critical
 
@@ -977,7 +1039,6 @@ void loop() {
 |---|---|---|
 | Global mutex on all hot paths | `broker.cpp` | Publish, subscribe, ACK, and session teardown all contend on one `std::mutex`. Under high fan-out (1000 subscribers, 10K msg/s), the lock becomes a throughput bottleneck. |
 | `sessions_` accessed without lock in accept loop | `broker.cpp:run()` | The main thread reads `sessions_.size()` and calls `sessions_.push_back()` while session threads call `removeSession()` under the mutex. This is a latent data race on the `sessions_` vector. |
-| Unbounded `client_acks_` sets | `broker.cpp` | Each ACK inserts into `unordered_set<uint64_t>` with no pruning. A client that ACKs millions of messages without the broker restarting will leak memory indefinitely. |
 
 ### Moderate
 
@@ -987,6 +1048,8 @@ void loop() {
 | `replayMessages` loads up to 1M messages per reconnect | `broker.cpp:replayMessagesForClient()` | A client with a large backlog can cause seconds-long blocking on the session thread during reconnection. |
 | `send()` does not handle partial writes | `session.cpp:send()` | `::send()` may return fewer bytes than requested on a loaded kernel buffer. The remainder is silently lost. |
 | No topic sanitization | `session.cpp` | Arbitrary byte strings are accepted as topic names. Topics containing null bytes, path separators, or control characters are stored and routed without validation. |
+| No session idle timeout | `broker.cpp` | Crashed clients leave zombie session threads alive indefinitely; each holds a file descriptor and stack allocation. |
+| No RESP authentication | `session.cpp` | Any TCP client on port 6379 can publish or subscribe to any topic with no credentials. |
 
 ### Low
 
@@ -996,6 +1059,13 @@ void loop() {
 | Hardcoded Conan paths in `CMakeLists.txt` | `CMakeLists.txt` | May fail to find packages on a machine with a different Conan cache location. |
 | No `ctest` integration | — | All tests are manual. CI pipelines cannot detect regressions automatically. |
 | RESP `PUBLISH` returns hardcoded `1` | `session.cpp:handleCommand()` | The actual subscriber count is not returned, breaking Redis-compatible tooling that relies on this value. |
+
+### Fixed in Phase 1 (branch: `demo/esp32-security`)
+
+| Issue | Resolution |
+|---|---|
+| Unbounded `client_acks_` sets (was Critical) | Replaced with `BoundedAckSet` — deque+hash set, MAX=10,000 entries, FIFO eviction. Fixed RAM per client ≈640 KB. |
+| LMDB grows unboundedly on disk (was Critical) | `LmdbStorage::compact()` + `purge_old_acks()` run every 1,000 publishes, keeping the last 100,000 messages. |
 
 ---
 
