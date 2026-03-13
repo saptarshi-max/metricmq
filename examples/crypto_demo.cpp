@@ -21,11 +21,14 @@ int main() {
     // Simulate a message to publish
     std::string topic = "sensors/temperature";
     std::string payload = R"({"device":"esp32-001","temp":23.5,"humidity":65})";
-    std::string message = topic + ":" + payload;
+    // Signing format: topic + payload (raw concatenation, no separator).
+    // This matches the format used by session.cpp and the ESP32 library.
+    std::string message = topic + payload;
 
     // Sign the message
     auto signature = metricmq::crypto::sign(message, keypair.secret_key);
-    std::cout << "\n[SIGN] Message: " << message << "\n";
+    std::cout << "\n[SIGN] topic:   " << topic << "\n";
+    std::cout << "       payload: " << payload << "\n";
     std::cout << "       Signature: " << metricmq::crypto::to_hex(signature).substr(0, 32) << "...\n";
 
     // Verify the signature (broker side)
@@ -33,9 +36,9 @@ int main() {
     std::cout << "\n[VERIFY] Result: " << (valid ? "VALID" : "INVALID") << "\n";
 
     // Test tampering detection
-    std::string tampered = topic + ":" + R"({"device":"esp32-001","temp":99.9,"humidity":65})";
+    std::string tampered = topic + R"({"device":"esp32-001","temp":99.9,"humidity":65})";
     bool tampered_valid = metricmq::crypto::verify(tampered, signature, keypair.public_key);
-    std::cout << "\n[TAMPER TEST] Modified payload验证: " << (tampered_valid ? "VALID (BAD!)" : "INVALID (GOOD!)") << "\n";
+    std::cout << "\n[TAMPER TEST] Modified payload result: " << (tampered_valid ? "VALID (BAD!)" : "INVALID (GOOD!)") << "\n";
 
     // Clean up secret key
     metricmq::crypto::secure_zero(keypair.secret_key);
