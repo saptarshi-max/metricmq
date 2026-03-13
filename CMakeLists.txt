@@ -127,3 +127,51 @@ target_link_libraries(protocol_comparison_benchmark PRIVATE metricmq_lib benchma
 
 add_executable(persistence_benchmark benchmark/persistence_benchmark.cpp)
 target_link_libraries(persistence_benchmark PRIVATE metricmq_lib benchmark::benchmark_main)
+
+# ─── CTest integration ────────────────────────────────────────────────────────
+# Run with:
+#   ctest --build-and-test ... --test-dir build/Release
+#   ctest -LE requires_broker          # standalone tests only (CI-safe)
+#   ctest -L requires_broker           # integration tests (need broker running)
+enable_testing()
+
+# Standalone — no broker needed; uses assert(), exits non-zero on failure
+add_test(NAME signing_unit_test
+    COMMAND signed_publish_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(signing_unit_test PROPERTIES
+    LABELS "unit"
+    TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "All.*tests passed|9/9"
+)
+
+# Standalone — exercises crypto API end-to-end, exits 0 on success
+add_test(NAME crypto_demo_test
+    COMMAND crypto_demo
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(crypto_demo_test PROPERTIES
+    LABELS "unit"
+    TIMEOUT 15
+    PASS_REGULAR_EXPRESSION "Demo Complete"
+)
+
+# Integration — require a broker on 127.0.0.1:6379 before running
+add_test(NAME exactly_once_integration
+    COMMAND exactly_once_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(exactly_once_integration PROPERTIES
+    LABELS "integration;requires_broker"
+    TIMEOUT 60
+)
+
+add_test(NAME persistence_integration
+    COMMAND persistence_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(persistence_integration PROPERTIES
+    LABELS "integration;requires_broker"
+    TIMEOUT 30
+)
