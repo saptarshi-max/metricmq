@@ -1005,20 +1005,19 @@ broker.run();   // Blocking; handles SIGINT for graceful shutdown
 - **Single global mutex** — all broker state is protected by one `std::mutex`.
   At >500 concurrent clients, lock contention becomes measurable.
 - **Key registration requires a code edit + rebuild** — no runtime registration API.
-- **No session idle timeout** — zombie threads from crashed clients remain until broker restart.
 - **No RESP authentication** — any TCP client on port 6379 has full read/write access.
 - **Partial writes on `send()`** — `::send()` may return fewer bytes than requested; the remainder is silently dropped.
 
-> **Phase 1 (implemented):** The two highest-severity OOM risks have been addressed:
-> `BoundedAckSet` caps in-memory ACK tracking at 10,000 entries per client, and
-> LMDB compaction runs every 1,000 publishes to keep disk usage bounded (last 100K messages).
+> **Phase 1 (implemented):** Six issues resolved — BoundedAckSet (ACK OOM), LMDB
+> compaction (disk saturation), session idle timeout (zombie threads), signing format
+> (crypto_demo.cpp), benchmark topic mismatch, and ctest integration. See §"Phase 1" below.
 
 ---
 
-## Phase 1 — Memory Safety & Storage Compaction
+## Phase 1 — Memory Safety, Stability & Tooling
 
-These changes ship on the `demo/esp32-security` branch and address the two highest-rated
-production risks from the original design.
+These changes ship on the `demo/esp32-security` branch and address six issues across
+memory safety, zombie connection cleanup, correctness, and CI integration.
 
 ### BoundedAckSet (replaces unbounded `unordered_set`)
 
@@ -1062,6 +1061,26 @@ broker after ~6 hours of uptime. Long-running overnight deployments are now safe
 > been offline for more than `100,000 / publish_rate` seconds will miss some messages on
 > reconnect — they will have been compacted away. For typical IoT polling rates (1 Hz),
 > that is a >27-hour replay window per topic, which covers most real-world outage scenarios.
+
+### Session Idle Timeout (zombie thread cleanup)
+
+**Before:** A crashed ESP32 that dropped TCP without sending `FIN` would leave its session
+thread alive indefinitely, holding a file descriptor and 1 MB stack.
+
+**After:** Each session sets `SO_RCVTIMEO = 30 s` on its socket. When `recv()` times out,
+the idle clock is checked. After `SESSION_IDLE_TIMEOUT_S = 300 s` (5 minutes) of no data,
+the connection is logged and closed — the thread exits cleanly and the fd is reclaimed.
+
+The ESP32 keep-alive PING fires every 60 s, so a healthy device resets the idle clock well
+within the 300 s window. Only truly silent (crashed or off-network) clients get disconnected.
+
+### Additional Fixes
+
+| Fix | Details |
+|---|---|
+| **Signing format** | `crypto_demo.cpp` now signs `topic + payload` (no colon) — matches broker and ESP32 library |
+| **Benchmark topic** | `BM_SingleSubscriber_Throughput` publisher now publishes to `bench/sub_throughput` — was always measuring 0 |
+| **ctest integration** | `enable_testing()` + 4 `add_test()` targets in CMakeLists.txt; run unit tests with `ctest -LE requires_broker` |
 
 ---
 

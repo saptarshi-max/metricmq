@@ -1029,9 +1029,9 @@ persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
 
 ## 13. Architectural Limitations & Known Issues
 
-> **Phase 1 status:** The two previously Critical OOM issues — unbounded ACK sets and LMDB
-> map saturation — have been resolved. See §7.2 for the compaction API and `BoundedAckSet`
-> in `broker.hpp` for the bounded ACK tracking implementation.
+> **Phase 1 status:** Six previously listed issues have been resolved on this branch.
+> See the "Fixed in Phase 1" table below for the full list. The remaining Critical items
+> (global mutex contention, sessions_ data race) are architectural and require larger refactors.
 
 ### Critical
 
@@ -1044,11 +1044,9 @@ persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
 
 | Issue | Location | Impact |
 |---|---|---|
-| Signing format inconsistency | `crypto_demo.cpp` vs broker | `crypto_demo.cpp` signs `topic + ":" + payload` while the broker verifies `topic + payload`. These are incompatible. Do not use `crypto_demo.cpp` as a reference for device integration. |
 | `replayMessages` loads up to 1M messages per reconnect | `broker.cpp:replayMessagesForClient()` | A client with a large backlog can cause seconds-long blocking on the session thread during reconnection. |
 | `send()` does not handle partial writes | `session.cpp:send()` | `::send()` may return fewer bytes than requested on a loaded kernel buffer. The remainder is silently lost. |
 | No topic sanitization | `session.cpp` | Arbitrary byte strings are accepted as topic names. Topics containing null bytes, path separators, or control characters are stored and routed without validation. |
-| No session idle timeout | `broker.cpp` | Crashed clients leave zombie session threads alive indefinitely; each holds a file descriptor and stack allocation. |
 | No RESP authentication | `session.cpp` | Any TCP client on port 6379 can publish or subscribe to any topic with no credentials. |
 
 ### Low
@@ -1057,10 +1055,18 @@ persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
 |---|---|---|
 | `throughput.cpp` is an empty stub | `benchmark/throughput.cpp` | This benchmark binary does nothing. Do not rely on it for throughput numbers. |
 | Hardcoded Conan paths in `CMakeLists.txt` | `CMakeLists.txt` | May fail to find packages on a machine with a different Conan cache location. |
-| No `ctest` integration | — | All tests are manual. CI pipelines cannot detect regressions automatically. |
 | RESP `PUBLISH` returns hardcoded `1` | `session.cpp:handleCommand()` | The actual subscriber count is not returned, breaking Redis-compatible tooling that relies on this value. |
 
 ### Fixed in Phase 1 (branch: `demo/esp32-security`)
+
+| Issue | Resolution |
+|---|---|
+| Unbounded `client_acks_` sets (was Critical) | Replaced with `BoundedAckSet` — deque+hash set, MAX=10,000 entries, FIFO eviction. Fixed RAM per client ≈640 KB. |
+| LMDB grows unboundedly on disk (was Critical) | `LmdbStorage::compact()` + `purge_old_acks()` run every 1,000 publishes, keeping the last 100,000 messages. |
+| No session idle timeout (was Moderate) | `SO_RCVTIMEO` set to 30 s per socket; `last_activity_` tracked in `Session`; connection closed after `SESSION_IDLE_TIMEOUT_S` = 300 s. |
+| Signing format inconsistency (was Moderate) | `crypto_demo.cpp` updated to `topic + payload` (no colon), matching `session.cpp` and the ESP32 library. |
+| Benchmark topic mismatch (was Low) | `BM_SingleSubscriber_Throughput` publisher now uses `bench/sub_throughput`, matching the subscriber. |
+| No `ctest` integration (was Low) | `enable_testing()` + `add_test()` in CMakeLists.txt; unit tests: `ctest -LE requires_broker`. |
 
 | Issue | Resolution |
 |---|---|
