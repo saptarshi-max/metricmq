@@ -97,9 +97,9 @@ static void BM_SingleSubscriber_Throughput(benchmark::State& state) {
     std::string payload = "test_message";
     
     for (auto _ : state) {
-        pub.send("bench/throughput", payload);
+        pub.send("bench/sub_throughput", payload);
     }
-    
+
     // Wait for all messages to be received
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     running = false;
