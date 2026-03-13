@@ -61,9 +61,10 @@ GENERATE_HTML          = YES
 HTML_OUTPUT            = html
 HTML_COLORSTYLE        = LIGHT
 HTML_TIMESTAMP         = YES
+GENERATE_TREEVIEW      = NO
 
-# Nicer look with Doxygen-Awesome (optional, falls back to default gracefully)
-# HTML_EXTRA_STYLESHEET  = docs/doxygen-awesome.css
+# Logo size fix + optional theme overrides
+HTML_EXTRA_STYLESHEET  = docs/doxygen-extra.css
 
 GENERATE_LATEX         = NO
 GENERATE_RTF           = NO
