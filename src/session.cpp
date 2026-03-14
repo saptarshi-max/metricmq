@@ -428,9 +428,19 @@ void Session::sendResp(const RespValue& value) {
 
 void Session::send(const std::string& data) {
     if (sock_fd_ == -1) return;
-    int sent = ::send(sock_fd_, data.c_str(), static_cast<int>(data.size()), 0);
-    if (sent == -1) {
-        std::cerr << "Send failed\n";
+    // Loop until all bytes are sent. ::send() on a loaded kernel buffer may
+    // return fewer bytes than requested; silently dropping the remainder would
+    // produce truncated frames on the receiver.
+    const char* ptr = data.c_str();
+    size_t remaining = data.size();
+    while (remaining > 0) {
+        int sent = ::send(sock_fd_, ptr, static_cast<int>(remaining), 0);
+        if (sent < 0) {
+            LOG_WARN("send() failed on fd={}: errno={}", sock_fd_, errno);
+            break;
+        }
+        ptr       += sent;
+        remaining -= static_cast<size_t>(sent);
     }
 }
 

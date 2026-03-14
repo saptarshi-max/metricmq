@@ -41,12 +41,12 @@ add_library(metricmq_lib STATIC
     src/crypto/keystore.cpp
 )
 
-target_include_directories(metricmq_lib PUBLIC 
+target_include_directories(metricmq_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
-    "C:/Users/Sapta/.conan2/p/lmdbf2a2ec8d6cae2/p/include"
-    "C:/Users/Sapta/.conan2/p/spdloa333e6e11c7ff/p/include"
-    "C:/Users/Sapta/.conan2/p/fmtefbe862283345/p/include"
+    # lmdb, spdlog, and fmt include dirs propagate automatically from
+    # the Conan-generated targets in target_link_libraries below.
+    # Do NOT add machine-specific Conan cache paths here.
 )
 target_link_libraries(metricmq_lib PUBLIC
     Poco::Net Poco::Util Poco::JSON

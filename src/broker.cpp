@@ -144,12 +144,11 @@ uint64_t Broker::publish(const std::string& topic, const std::string& payload) {
 }
 
 void Broker::replayMessages(Session* session, const std::string& topic, uint64_t from_seq) {
-    // Persist a minimal mutex lock just for accessing persistence
-    // Note: Don't lock the full mutex here since subscribe() already handled that
     if (persistence_) {
-        auto messages = persistence_->load_range(from_seq, from_seq + 1000000);  // Load up to 1M messages
+        // Cap replay to MAX_STORED_MESSAGES — matches the compaction window so we never
+        // request records that have already been deleted from LMDB.
+        auto messages = persistence_->load_range(from_seq, from_seq + MAX_STORED_MESSAGES);
         for (const auto& [seq, msg_topic, msg_payload] : messages) {
-            // Only replay if topic matches
             if (msg_topic == topic) {
                 session->send(msg_payload);
             }
@@ -289,13 +288,19 @@ void Broker::run() {
             }
 
             auto session = std::make_shared<Session>(client, this);
-            sessions_.push_back(session);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                sessions_.push_back(session);
+            }
             active_connections_++;
             std::thread([session] { session->run(); }).detach();
-            
+
             // Update metrics
             Metrics::instance().incrementConnections();
-            Metrics::instance().setActiveConnections(sessions_.size());
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                Metrics::instance().setActiveConnections(sessions_.size());
+            }
         }
     }
     
@@ -413,12 +418,12 @@ void Broker::unregisterClient(const std::string& client_id) {
 void Broker::replayMessagesForClient(Session* session, const std::string& topic, const std::string& client_id) {
     // Get last ACK'd sequence for this client
     uint64_t last_ack = getLastAck(client_id);
-    
-    // Replay only messages after last ACK
+
     if (persistence_) {
-        auto messages = persistence_->load_range(last_ack + 1, last_ack + 1000000);
+        // Cap at MAX_STORED_MESSAGES: requesting beyond the compaction window only
+        // wastes LMDB cursor time on records that were already deleted.
+        auto messages = persistence_->load_range(last_ack + 1, last_ack + MAX_STORED_MESSAGES);
         for (const auto& [seq, msg_topic, msg_payload] : messages) {
-            // Only replay if topic matches and not already ACK'd
             if (msg_topic == topic && !isAcked(client_id, seq)) {
                 session->send(msg_payload);
             }
