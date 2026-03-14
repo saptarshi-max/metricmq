@@ -278,7 +278,7 @@ metricmq_ack_tracking_efficiency     # Gauge (0-100%)
 
 ## 🔐 Security Layer
 
-MetricMQ introduces **first-class Ed25519 message signing** for authentication and integrity verification.
+MetricMQ introduces **first-class Ed25519 message** for authentication and integrity verification.
 
 ### Security Model
 
@@ -1006,18 +1006,20 @@ broker.run();   // Blocking; handles SIGINT for graceful shutdown
   At >500 concurrent clients, lock contention becomes measurable.
 - **Key registration requires a code edit + rebuild** — no runtime registration API.
 - **No RESP authentication** — any TCP client on port 6379 has full read/write access.
-- **Partial writes on `send()`** — `::send()` may return fewer bytes than requested; the remainder is silently dropped.
+- **No topic sanitization** — null bytes and path separators are accepted in topic names.
+- **RESP `PUBLISH` returns hardcoded `1`** — actual delivery count not reported.
 
-> **Phase 1 (implemented):** Six issues resolved — BoundedAckSet (ACK OOM), LMDB
-> compaction (disk saturation), session idle timeout (zombie threads), signing format
-> (crypto_demo.cpp), benchmark topic mismatch, and ctest integration. See §"Phase 1" below.
+> **Phase 1 (implemented):** Eleven issues resolved — BoundedAckSet (ACK OOM), LMDB
+> compaction (disk saturation), session idle timeout (zombie threads), `sessions_` data race,
+> `send()` partial writes, replay window cap, signing format, benchmark topic, throughput
+> benchmark stub, hardcoded Conan paths, and ctest integration. See §"Phase 1" below.
 
 ---
 
 ## Phase 1 — Memory Safety, Stability & Tooling
 
-These changes ship on the `demo/esp32-security` branch and address six issues across
-memory safety, zombie connection cleanup, correctness, and CI integration.
+These changes ship on the `demo/esp32-security` branch and address eleven issues across
+memory safety, thread safety, I/O correctness, zombie connection cleanup, tooling, and CI integration.
 
 ### BoundedAckSet (replaces unbounded `unordered_set`)
 
@@ -1078,9 +1080,27 @@ within the 300 s window. Only truly silent (crashed or off-network) clients get 
 
 | Fix | Details |
 |---|---|
+| **`sessions_` data race** | `push_back()` and `sessions_.size()` in the accept loop now protected by `mutex_`, matching `removeSession()` |
+| **`send()` partial writes** | `::send()` now loops until all bytes are written; logs warning on error |
+| **Replay window cap** | Both `load_range()` calls in `replayMessages` capped at `MAX_STORED_MESSAGES` (100K) — was a hardcoded 1M |
+| **Throughput benchmark stub** | `benchmark/throughput.cpp` replaced with a real publisher benchmark reporting msg/s, MB/s, µs/msg |
+| **Hardcoded Conan paths** | Three machine-specific absolute include paths removed from `CMakeLists.txt` |
 | **Signing format** | `crypto_demo.cpp` now signs `topic + payload` (no colon) — matches broker and ESP32 library |
 | **Benchmark topic** | `BM_SingleSubscriber_Throughput` publisher now publishes to `bench/sub_throughput` — was always measuring 0 |
 | **ctest integration** | `enable_testing()` + 4 `add_test()` targets in CMakeLists.txt; run unit tests with `ctest -LE requires_broker` |
+
+---
+
+## ⚠️ Known Issues — Planned for Next Version
+
+The following issues are known and will be addressed in a future release:
+
+| Issue | Impact |
+|---|---|
+| **No RESP authentication** | Any TCP client on port 6379 has full read/write access to all topics. A password challenge will be added to the session handshake. |
+| **Global mutex on all hot paths** | All broker state is guarded by a single `std::mutex`. Measurable lock contention above ~500 concurrent clients. A per-topic lock refactor is planned. |
+| **No topic sanitization** | Topic names containing null bytes, `..`, or path separators are accepted without validation. |
+| **`RESP PUBLISH` returns hardcoded `1`** | The actual number of subscribers that received the message is not reported; always returns `:1\r\n`. |
 
 ---
 
@@ -1132,14 +1152,10 @@ New-NetFirewallRule -DisplayName "MetricMQ" `
 
 High-impact areas for contributors:
 
-1. **Fix topic mismatch** in `BM_SingleSubscriber_Throughput` — publisher and subscriber use different topic strings
-2. **Add `ctest` integration** — wire up `enable_testing()` / `add_test()` for CI
-3. **Remove hardcoded Conan paths** from `CMakeLists.txt` — breaks every build outside the original dev machine
-4. **Canonicalize the signing format** — `crypto_demo.cpp` uses `topic + ":" + payload`; `signed_publish_test.cpp` uses `topic + payload`; pick one and document it
-5. **Add manual ACK tests** — `auto_ack=false` path is completely untested
-6. **Add RESP authentication** — any TCP client on port 6379 has full access; a password challenge would help
-7. **Language bindings** — Python, Go, Rust, JavaScript clients
-8. **TLS/DTLS layer** — connection-level encryption (Ed25519 is message-level only)
+1. **Add manual ACK tests** — `auto_ack=false` path is completely untested
+2. **Add RESP authentication** — any TCP client on port 6379 has full access; a password challenge would help
+3. **Language bindings** — Python, Go, Rust, JavaScript clients
+4. **TLS/DTLS layer** — connection-level encryption (Ed25519 is message-level only)
 
 ---
 

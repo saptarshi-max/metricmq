@@ -1070,5 +1070,5 @@ persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
 
 ---
 
-*Last updated: 2026-03-13*
+*Last updated: 2026-03-14*
 *Branch: `demo/esp32-security`*

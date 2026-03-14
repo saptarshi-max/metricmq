@@ -568,24 +568,22 @@ while ($true) {
 
 ## 9. Coverage Gaps & Known Limitations
 
-> **Phase 1 mitigations**: The ACK-set OOM and LMDB map-full risks documented here have been
-> addressed by `BoundedAckSet` (max 10,000 ACKs per client) and periodic LMDB compaction
-> (every 1,000 publishes, keeping the last 100,000 messages). The risks below describe
-> what is still unverified by automated tests.
+> **Phase 1 mitigations**: Eleven issues have been resolved on the `demo/esp32-security` branch —
+> including ACK-set OOM (BoundedAckSet), LMDB disk saturation (compaction), zombie connections
+> (idle timeout), `sessions_` data race, `send()` partial writes, replay cap, signing format,
+> benchmark topic, throughput stub, hardcoded Conan paths, and ctest integration.
+> The gaps below describe what is still unverified by automated tests.
 
 | Gap | Risk level | Notes |
 |-----|-----------|-------|
 | **No broker-restart test** | High | `persistence_test` does not stop/restart the broker. True durability is not automatically verified. |
-| **No ctest integration** | High | All tests are manual. CI cannot detect regressions. |
 | **exactly_once_test exits 0 on failure** | High | Can silently pass in CI. Parse stdout for `❌` to detect failures. |
-| **No concurrency / race condition test** | High | The broker has a global mutex and multiple data races (see TECHNICAL.md §13). No stress test exists. |
+| **No concurrency / race condition test** | High | The broker uses a global mutex. No stress test exists to surface remaining contention issues. |
 | **No compaction validation test** | Medium | Phase 1 compaction runs, but no automated test verifies that deleted messages are truly gone and `get_last_seq()` is correct after compaction. |
 | **No BoundedAckSet eviction test** | Medium | The eviction path in `BoundedAckSet` (when `order_.size() >= MAX`) is not covered by any automated test. |
 | **No error-path tests** | Medium | Malformed frames, truncated payloads, binary frames with oversized headers — none are automatically tested. |
 | **No signed message rejection test** | Medium | The signing test verifies correct signatures. No test sends a garbled signature to the broker and checks for CMD_ERROR. |
 | **No topic sanitization test** | Medium | Topics with null bytes, path separators, or control characters are accepted; behavior is undefined. |
-| **Benchmark topic mismatch** | Low | `BM_SingleSubscriber_Throughput` always measures 0 received because it publishes to `bench/throughput` but subscribes to `bench/sub_throughput`. |
-| **`benchmark/throughput.cpp` is a stub** | Low | Prints one line and exits. Not a real benchmark. |
 | **No ESP32 automated test** | Low | ESP32 library is tested manually against hardware only. |
 
 ### Suggested next tests to add
