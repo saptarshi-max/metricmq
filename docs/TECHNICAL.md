@@ -1029,23 +1029,20 @@ persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
 
 ## 13. Architectural Limitations & Known Issues
 
-> **Phase 1 status:** Six previously listed issues have been resolved on this branch.
-> See the "Fixed in Phase 1" table below for the full list. The remaining Critical items
-> (global mutex contention, sessions_ data race) are architectural and require larger refactors.
+> **Phase 1 status:** Eleven issues have been resolved on this branch — six in the original
+> Phase 1 pass and five in a follow-up fix commit. The one remaining Critical item (global
+> mutex contention) is architectural and requires a larger per-topic lock refactor.
 
 ### Critical
 
 | Issue | Location | Impact |
 |---|---|---|
 | Global mutex on all hot paths | `broker.cpp` | Publish, subscribe, ACK, and session teardown all contend on one `std::mutex`. Under high fan-out (1000 subscribers, 10K msg/s), the lock becomes a throughput bottleneck. |
-| `sessions_` accessed without lock in accept loop | `broker.cpp:run()` | The main thread reads `sessions_.size()` and calls `sessions_.push_back()` while session threads call `removeSession()` under the mutex. This is a latent data race on the `sessions_` vector. |
 
 ### Moderate
 
 | Issue | Location | Impact |
 |---|---|---|
-| `replayMessages` loads up to 1M messages per reconnect | `broker.cpp:replayMessagesForClient()` | A client with a large backlog can cause seconds-long blocking on the session thread during reconnection. |
-| `send()` does not handle partial writes | `session.cpp:send()` | `::send()` may return fewer bytes than requested on a loaded kernel buffer. The remainder is silently lost. |
 | No topic sanitization | `session.cpp` | Arbitrary byte strings are accepted as topic names. Topics containing null bytes, path separators, or control characters are stored and routed without validation. |
 | No RESP authentication | `session.cpp` | Any TCP client on port 6379 can publish or subscribe to any topic with no credentials. |
 
@@ -1053,20 +1050,23 @@ persistence silently fails, and all LMDB writes (messages and ACKs) are dropped.
 
 | Issue | Location | Impact |
 |---|---|---|
-| `throughput.cpp` is an empty stub | `benchmark/throughput.cpp` | This benchmark binary does nothing. Do not rely on it for throughput numbers. |
-| Hardcoded Conan paths in `CMakeLists.txt` | `CMakeLists.txt` | May fail to find packages on a machine with a different Conan cache location. |
 | RESP `PUBLISH` returns hardcoded `1` | `session.cpp:handleCommand()` | The actual subscriber count is not returned, breaking Redis-compatible tooling that relies on this value. |
 
 ### Fixed in Phase 1 (branch: `demo/esp32-security`)
 
 | Issue | Resolution |
 |---|---|
-| Unbounded `client_acks_` sets (was Critical) | Replaced with `BoundedAckSet` — deque+hash set, MAX=10,000 entries, FIFO eviction. Fixed RAM per client ≈640 KB. |
+| Unbounded `client_acks_` sets (was Critical) | `BoundedAckSet` — deque+hash set, MAX=10,000 entries, FIFO eviction. Fixed RAM per client ≈640 KB. |
 | LMDB grows unboundedly on disk (was Critical) | `LmdbStorage::compact()` + `purge_old_acks()` run every 1,000 publishes, keeping the last 100,000 messages. |
-| No session idle timeout (was Moderate) | `SO_RCVTIMEO` set to 30 s per socket; `last_activity_` tracked in `Session`; connection closed after `SESSION_IDLE_TIMEOUT_S` = 300 s. |
-| Signing format inconsistency (was Moderate) | `crypto_demo.cpp` updated to `topic + payload` (no colon), matching `session.cpp` and the ESP32 library. |
-| Benchmark topic mismatch (was Low) | `BM_SingleSubscriber_Throughput` publisher now uses `bench/sub_throughput`, matching the subscriber. |
-| No `ctest` integration (was Low) | `enable_testing()` + `add_test()` in CMakeLists.txt; unit tests: `ctest -LE requires_broker`. |
+| `sessions_` data race in accept loop (was Critical) | `push_back()` and `sessions_.size()` in `run()` now protected by `mutex_`, matching `removeSession()`. |
+| No session idle timeout (was Moderate) | `SO_RCVTIMEO=30 s`; `last_activity_` in Session; closes after `SESSION_IDLE_TIMEOUT_S`=300 s. |
+| `replayMessages` loads up to 1M per reconnect (was Moderate) | Both `load_range()` calls now capped at `MAX_STORED_MESSAGES` (100,000) — matches the compaction window. |
+| `send()` silently drops partial writes (was Moderate) | Loops `::send()` until all bytes are written; logs warning on error. |
+| Signing format inconsistency (was Moderate) | `crypto_demo.cpp` updated to `topic + payload` (no colon), matching broker and ESP32 library. |
+| Benchmark topic mismatch (was Low) | `BM_SingleSubscriber_Throughput` publisher now uses `bench/sub_throughput`. |
+| `throughput.cpp` empty stub (was Low) | Replaced with a real standalone publisher benchmark (msg/s, MB/s, us/msg). |
+| Hardcoded Conan cache paths (was Low) | Removed three machine-specific absolute paths; Conan targets propagate includes automatically. |
+| No `ctest` integration (was Low) | `enable_testing()` + `add_test()` in CMakeLists.txt; `ctest -LE requires_broker`. |
 
 ---
 
