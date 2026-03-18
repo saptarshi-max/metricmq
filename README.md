@@ -17,9 +17,7 @@ When building something at the edge, latency and memory-footprint size both play
 
 MetricMQ is an attempt to fill that gap. The broker compiles to 328 KB. The ESP32 client library uses around 2 KB of RAM at idle (4 KB when actively receiving). It runs the same binary protocol on a microcontroller and on a Linux server, does exactly-once delivery with ACK tracking so you know messages arrived, and has Ed25519 message signing built in — the broker rejects unsigned or tampered publishes at the wire level, before they ever reach a subscriber.
 
-One more thing worth mentioning: MetricMQ understands Redis's text protocol (RESP), which means if you already have `redis-cli` installed, you can point it at MetricMQ and start publishing and subscribing immediately — no extra tools, no SDK, nothing to install. It's handy for quick tests and debugging without writing a single line of code.
-
-For production or embedded use, there's also a compact binary protocol that's about 40% smaller on the wire — better suited for devices where bandwidth or CPU actually matters. Both protocols are served on the same port; MetricMQ figures out which one a client is using from the first byte it sends.
+One more thing worth mentioning: MetricMQ understands Redis's text protocol (RESP), which means if you already have `redis-cli` installed, you can point it at MetricMQ and start publishing and subscribing immediately, no extra tools to install. It's handy for quick tests and debugging without writing new lines of code.
 
 ---
 
