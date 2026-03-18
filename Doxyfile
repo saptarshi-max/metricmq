@@ -1,0 +1,129 @@
+# Doxyfile — MetricMQ Documentation Configuration
+# Generate HTML docs:  doxygen Doxyfile
+# Open:  docs/doxygen/html/index.html
+
+#---------------------------------------------------------------------------
+# Project identity
+#---------------------------------------------------------------------------
+PROJECT_NAME           = "MetricMQ"
+PROJECT_NUMBER         = "0.1.0"
+PROJECT_BRIEF          = "Lightweight C++20 message broker for IoT/edge devices"
+PROJECT_LOGO           = assets/img/MetricMQ.png
+OUTPUT_DIRECTORY       = docs/doxygen
+
+#---------------------------------------------------------------------------
+# Input sources (public API + internal implementation)
+#---------------------------------------------------------------------------
+INPUT                  = include/metricmq \
+                         src \
+                         examples \
+                         esp32-metricmq/src \
+                         docs/mainpage.md
+
+RECURSIVE              = YES
+
+# Patterns to process
+FILE_PATTERNS          = *.hpp \
+                         *.h   \
+                         *.cpp \
+                         *.md
+
+# Use docs/mainpage.md as the Doxygen landing page
+USE_MDFILE_AS_MAINPAGE = docs/mainpage.md
+
+# Exclude generated, build, and vendored files
+EXCLUDE_PATTERNS       = */build/* \
+                         */cmake-build-debug/* \
+                         */build_old/* \
+                         */conan_toolchain.cmake \
+                         *Config.cmake \
+                         *Targets.cmake \
+                         *.vcxproj \
+                         *.sln
+
+#---------------------------------------------------------------------------
+# Extraction: document everything, even undocumented symbols
+#---------------------------------------------------------------------------
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_ANON_NSPACES   = NO
+INTERNAL_DOCS          = NO
+
+# Show where each symbol is defined (file + line)
+SHOW_INCLUDE_FILES     = YES
+SHOW_USED_FILES        = YES
+
+#---------------------------------------------------------------------------
+# Output formats
+#---------------------------------------------------------------------------
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_COLORSTYLE        = LIGHT
+HTML_TIMESTAMP         = YES
+GENERATE_TREEVIEW      = NO
+
+# Logo size fix + optional theme overrides
+HTML_EXTRA_STYLESHEET  = docs/doxygen-extra.css
+
+GENERATE_LATEX         = NO
+GENERATE_RTF           = NO
+GENERATE_MAN           = NO
+GENERATE_XML           = NO
+
+#---------------------------------------------------------------------------
+# Diagrams (requires Graphviz dot on PATH — optional)
+#---------------------------------------------------------------------------
+HAVE_DOT               = YES
+DOT_PATH               = C:/Program Files/Graphviz/bin
+DOT_GRAPH_MAX_NODES    = 50
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+CLASS_DIAGRAMS         = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+UML_LOOK               = YES
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+TEMPLATE_RELATIONS     = YES
+
+#---------------------------------------------------------------------------
+# Preprocessing — so Doxygen sees platform-specific code correctly
+#---------------------------------------------------------------------------
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+PREDEFINED             = _WIN32 \
+                         WIN32_LEAN_AND_MEAN \
+                         NOMINMAX
+
+#---------------------------------------------------------------------------
+# Source browsing — click any symbol to see its source
+#---------------------------------------------------------------------------
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+#---------------------------------------------------------------------------
+# Warnings — treat undocumented members as warnings
+#---------------------------------------------------------------------------
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = docs/doxygen/warnings.log
+
+#---------------------------------------------------------------------------
+# Search (browser-side)
+#---------------------------------------------------------------------------
+SEARCHENGINE           = YES
+SERVER_BASED_SEARCH    = NO
+
+#---------------------------------------------------------------------------
+# Markdown support
+#---------------------------------------------------------------------------
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES

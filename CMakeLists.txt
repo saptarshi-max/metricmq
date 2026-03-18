@@ -4,7 +4,9 @@ project(MetricMQ CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Conan toolchain (generated in build/)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    message(FATAL_ERROR "CMAKE_TOOLCHAIN_FILE not defined. Run cmake with -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake")
+endif()
 include(${CMAKE_BINARY_DIR}/conan_toolchain.cmake)
 
 # Force C++17 minimum after toolchain inclusion
@@ -16,10 +18,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Poco REQUIRED COMPONENTS Net Util JSON)
-find_package(Boost REQUIRED)  # No COMPONENTS needed anymore
+find_package(Boost REQUIRED)
 find_package(lmdb REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(benchmark REQUIRED)
+find_package(libsodium REQUIRED)
 
 # Core library
 add_library(metricmq_lib STATIC
@@ -34,20 +37,23 @@ add_library(metricmq_lib STATIC
     src/logger.cpp
     src/metrics.cpp
     src/metrics_server.cpp
+    src/crypto/signing.cpp
+    src/crypto/keystore.cpp
 )
 
-target_include_directories(metricmq_lib PUBLIC 
+target_include_directories(metricmq_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
-    "C:/Users/Sapta/.conan2/p/lmdbf2a2ec8d6cae2/p/include"
-    "C:/Users/Sapta/.conan2/p/spdloa333e6e11c7ff/p/include"
-    "C:/Users/Sapta/.conan2/p/fmtefbe862283345/p/include"
+    # lmdb, spdlog, and fmt include dirs propagate automatically from
+    # the Conan-generated targets in target_link_libraries below.
+    # Do NOT add machine-specific Conan cache paths here.
 )
 target_link_libraries(metricmq_lib PUBLIC
     Poco::Net Poco::Util Poco::JSON
     boost::boost  # Includes asio, beast, system, etc.
     lmdb::lmdb
     spdlog::spdlog
+    libsodium::libsodium
 )
 
 # Platform-specific libraries
@@ -98,6 +104,17 @@ target_link_libraries(persistence_test PRIVATE metricmq_lib)
 add_executable(exactly_once_test examples/exactly_once_test.cpp)
 target_link_libraries(exactly_once_test PRIVATE metricmq_lib)
 
+# Crypto example
+add_executable(crypto_demo examples/crypto_demo.cpp)
+target_link_libraries(crypto_demo PRIVATE metricmq_lib)
+
+add_executable(signed_publish_test examples/signed_publish_test.cpp)
+target_link_libraries(signed_publish_test PRIVATE metricmq_lib)
+
+# Tools
+add_executable(metricmq-keygen tools/keygen.cpp)
+target_link_libraries(metricmq-keygen PRIVATE metricmq_lib)
+
 # Google Benchmark suite
 add_executable(latency_benchmark benchmark/latency_benchmark.cpp)
 target_link_libraries(latency_benchmark PRIVATE metricmq_lib benchmark::benchmark_main)
@@ -110,3 +127,51 @@ target_link_libraries(protocol_comparison_benchmark PRIVATE metricmq_lib benchma
 
 add_executable(persistence_benchmark benchmark/persistence_benchmark.cpp)
 target_link_libraries(persistence_benchmark PRIVATE metricmq_lib benchmark::benchmark_main)
+
+# ─── CTest integration ────────────────────────────────────────────────────────
+# Run with:
+#   ctest --build-and-test ... --test-dir build/Release
+#   ctest -LE requires_broker          # standalone tests only (CI-safe)
+#   ctest -L requires_broker           # integration tests (need broker running)
+enable_testing()
+
+# Standalone — no broker needed; uses assert(), exits non-zero on failure
+add_test(NAME signing_unit_test
+    COMMAND signed_publish_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(signing_unit_test PROPERTIES
+    LABELS "unit"
+    TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "All.*tests passed|9/9"
+)
+
+# Standalone — exercises crypto API end-to-end, exits 0 on success
+add_test(NAME crypto_demo_test
+    COMMAND crypto_demo
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(crypto_demo_test PROPERTIES
+    LABELS "unit"
+    TIMEOUT 15
+    PASS_REGULAR_EXPRESSION "Demo Complete"
+)
+
+# Integration — require a broker on 127.0.0.1:6379 before running
+add_test(NAME exactly_once_integration
+    COMMAND exactly_once_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(exactly_once_integration PROPERTIES
+    LABELS "integration;requires_broker"
+    TIMEOUT 60
+)
+
+add_test(NAME persistence_integration
+    COMMAND persistence_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(persistence_integration PROPERTIES
+    LABELS "integration;requires_broker"
+    TIMEOUT 30
+)

@@ -63,8 +63,10 @@ uint64_t BinaryProtocol::readUint64(const std::string& buffer, size_t offset) {
 }
 
 std::string BinaryProtocol::serialize(const BinaryFrame& frame) {
+    // Calculate size: base + topic + payload + optional signature (64B) + key_id (4B)
+    size_t extra_size = frame.is_signed ? (SIGNATURE_SIZE + KEY_ID_SIZE) : 0;
     std::string buffer;
-    buffer.reserve(MIN_FRAME_SIZE + frame.topic.size() + frame.payload.size());
+    buffer.reserve(MIN_FRAME_SIZE + frame.topic.size() + frame.payload.size() + extra_size);
 
     // Header: [Version: 1B][Command: 1B][Sequence: 8B][Topic Len: 2B][Payload Len: 4B]
     buffer.push_back(static_cast<char>(frame.version));
@@ -76,6 +78,12 @@ std::string BinaryProtocol::serialize(const BinaryFrame& frame) {
     // Variable-length data
     buffer.append(frame.topic);
     buffer.append(frame.payload);
+
+    // Append signature data for signed frames
+    if (frame.is_signed) {
+        buffer.append(reinterpret_cast<const char*>(frame.signature.data()), SIGNATURE_SIZE);
+        writeUint32(buffer, frame.key_id);
+    }
 
     return buffer;
 }
@@ -91,10 +99,11 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
 
     // Parse header
     frame.version = static_cast<uint8_t>(buffer[offset++]);
-    
-    // Version check
+
+    // Version mismatch: return nullopt so the session drops this frame gracefully
+    // instead of throwing, which would crash the entire broker via std::terminate().
     if (frame.version != BINARY_PROTOCOL_VERSION) {
-        throw std::runtime_error("Unsupported protocol version: " + std::to_string(frame.version));
+        return std::nullopt;
     }
 
     frame.command = static_cast<BinaryCommand>(buffer[offset++]);
@@ -107,10 +116,26 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
     uint32_t payload_len = readUint32(buffer, offset);
     offset += 4;
 
+    // Enforce hard limits before computing total_size.
+    // Without these checks a malicious client can claim a 4 GB payload_len and
+    // cause the session to accumulate gigabytes in recv_buffer_ waiting for data
+    // that will never arrive, exhausting broker RAM.
+    if (topic_len > MAX_TOPIC_LEN) {
+        return std::nullopt;  // Session will hit MAX_RECV_BUFFER limit and disconnect
+    }
+    if (payload_len > MAX_PAYLOAD_LEN) {
+        return std::nullopt;
+    }
+
+    // Check if this is a signed frame
+    bool is_signed_cmd = (frame.command == BinaryCommand::CMD_SIGNED_PUBLISH ||
+                          frame.command == BinaryCommand::CMD_SIGNED_MESSAGE);
+    size_t sig_size = is_signed_cmd ? (SIGNATURE_SIZE + KEY_ID_SIZE) : 0;
+
     // Check if we have complete frame
-    size_t total_size = MIN_FRAME_SIZE + topic_len + payload_len;
+    size_t total_size = MIN_FRAME_SIZE + topic_len + payload_len + sig_size;
     if (buffer.size() < total_size) {
-        return std::nullopt;  // Incomplete frame
+        return std::nullopt;  // Incomplete frame — wait for more data
     }
 
     // Parse variable-length data
@@ -122,6 +147,15 @@ std::optional<std::pair<BinaryFrame, size_t>> BinaryProtocol::parse(const std::s
     if (payload_len > 0) {
         frame.payload = buffer.substr(offset, payload_len);
         offset += payload_len;
+    }
+
+    // Parse signature data for signed frames
+    if (is_signed_cmd) {
+        std::memcpy(frame.signature.data(), buffer.data() + offset, SIGNATURE_SIZE);
+        offset += SIGNATURE_SIZE;
+        frame.key_id = readUint32(buffer, offset);
+        offset += KEY_ID_SIZE;
+        frame.is_signed = true;
     }
 
     return std::make_pair(frame, total_size);

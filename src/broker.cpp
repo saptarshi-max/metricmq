@@ -103,6 +103,11 @@ uint64_t Broker::publish(const std::string& topic, const std::string& payload) {
     if (persistence_) {
         persistence_->save(seq, topic, payload);
     }
+
+    // Trigger periodic compaction (runs outside the hot path every COMPACT_EVERY publishes)
+    if (++publish_count_ % COMPACT_EVERY == 0) {
+        runCompactionIfDue();
+    }
     
     // Find subscribers for this topic
     int delivered = 0;
@@ -139,12 +144,11 @@ uint64_t Broker::publish(const std::string& topic, const std::string& payload) {
 }
 
 void Broker::replayMessages(Session* session, const std::string& topic, uint64_t from_seq) {
-    // Persist a minimal mutex lock just for accessing persistence
-    // Note: Don't lock the full mutex here since subscribe() already handled that
     if (persistence_) {
-        auto messages = persistence_->load_range(from_seq, from_seq + 1000000);  // Load up to 1M messages
+        // Cap replay to MAX_STORED_MESSAGES — matches the compaction window so we never
+        // request records that have already been deleted from LMDB.
+        auto messages = persistence_->load_range(from_seq, from_seq + MAX_STORED_MESSAGES);
         for (const auto& [seq, msg_topic, msg_payload] : messages) {
-            // Only replay if topic matches
             if (msg_topic == topic) {
                 session->send(msg_payload);
             }
@@ -175,6 +179,7 @@ void Broker::removeSession(Session* session) {
             [session](const auto& s) { return s.get() == session; }),
         sessions_.end()
     );
+    active_connections_--;
     
     // Update metrics
     Metrics::instance().incrementDisconnections();
@@ -190,6 +195,15 @@ int Broker::countTotalSubscribers() const {
         count += subscribers.size();
     }
     return count;
+}
+
+void Broker::runCompactionIfDue() {
+    // Must be called under the broker mutex (already held by publish())
+    if (!persistence_ || current_sequence_ <= MAX_STORED_MESSAGES) return;
+    uint64_t threshold = current_sequence_ - MAX_STORED_MESSAGES;
+    LOG_INFO("Running LMDB compaction: purging seq <= {}", threshold);
+    persistence_->compact(threshold);
+    persistence_->purge_old_acks(threshold);
 }
 
 void Broker::run() {
@@ -214,8 +228,16 @@ void Broker::run() {
     addr.sin_port = htons(port_);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    bind(server_fd, (sockaddr*)&addr, sizeof(addr));
-    listen(server_fd, 10);
+    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG_CRITICAL("bind() failed on port {}: errno={}", port_, errno);
+        close(server_fd);
+        return;
+    }
+    if (listen(server_fd, 10) < 0) {
+        LOG_CRITICAL("listen() failed: errno={}", errno);
+        close(server_fd);
+        return;
+    }
     
     server_fd_ = server_fd;  // Store for shutdown
     
@@ -257,13 +279,28 @@ void Broker::run() {
             }
             
             LOG_INFO("New client connected: fd={}", client);
+
+            // Enforce connection cap before allocating a session
+            if (active_connections_.load() >= MAX_CONNECTIONS) {
+                LOG_WARN("Connection limit ({}) reached — rejecting fd={}", MAX_CONNECTIONS, client);
+                close(client);
+                continue;
+            }
+
             auto session = std::make_shared<Session>(client, this);
-            sessions_.push_back(session);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                sessions_.push_back(session);
+            }
+            active_connections_++;
             std::thread([session] { session->run(); }).detach();
-            
+
             // Update metrics
             Metrics::instance().incrementConnections();
-            Metrics::instance().setActiveConnections(sessions_.size());
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                Metrics::instance().setActiveConnections(sessions_.size());
+            }
         }
     }
     
@@ -344,7 +381,7 @@ bool Broker::isAcked(const std::string& client_id, uint64_t sequence) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = client_acks_.find(client_id);
     if (it != client_acks_.end()) {
-        return it->second.count(sequence) > 0;
+        return it->second.contains(sequence);
     }
     return false;
 }
@@ -359,14 +396,15 @@ void Broker::registerClient(const std::string& client_id, Session* session) {
     
     client_sessions_[client_id] = session;
     
-    // Load ACK state from persistence
+    // Load ACK state from persistence into bounded set (caps at BoundedAckSet::MAX)
     if (persistence_) {
         auto acks = persistence_->load_acks(client_id);
-        client_acks_[client_id] = acks;
-        
-        // Calculate last_ack
-        if (!acks.empty()) {
-            last_ack_seq_[client_id] = *std::max_element(acks.begin(), acks.end());
+        auto& bounded = client_acks_[client_id];
+        for (uint64_t seq : acks) {
+            bounded.insert(seq);
+        }
+        if (!bounded.empty()) {
+            last_ack_seq_[client_id] = bounded.max_seq();
         }
     }
 }
@@ -380,12 +418,12 @@ void Broker::unregisterClient(const std::string& client_id) {
 void Broker::replayMessagesForClient(Session* session, const std::string& topic, const std::string& client_id) {
     // Get last ACK'd sequence for this client
     uint64_t last_ack = getLastAck(client_id);
-    
-    // Replay only messages after last ACK
+
     if (persistence_) {
-        auto messages = persistence_->load_range(last_ack + 1, last_ack + 1000000);
+        // Cap at MAX_STORED_MESSAGES: requesting beyond the compaction window only
+        // wastes LMDB cursor time on records that were already deleted.
+        auto messages = persistence_->load_range(last_ack + 1, last_ack + MAX_STORED_MESSAGES);
         for (const auto& [seq, msg_topic, msg_payload] : messages) {
-            // Only replay if topic matches and not already ACK'd
             if (msg_topic == topic && !isAcked(client_id, seq)) {
                 session->send(msg_payload);
             }

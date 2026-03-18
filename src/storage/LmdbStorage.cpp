@@ -13,7 +13,7 @@ LmdbStorage::LmdbStorage(const std::string& db_path) : env_(nullptr), dbi_(0) {
     }
 
     mdb_env_set_maxdbs(env_, 1);
-    mdb_env_set_mapsize(env_, 10485760); // 10MB initial size
+    mdb_env_set_mapsize(env_, 1024ULL * 1024 * 1024); // 1 GB — prevents silent truncation under load
 
     rc = mdb_env_open(env_, db_path.c_str(), MDB_NOSUBDIR | MDB_WRITEMAP, 0664);
     if (rc != 0) {
@@ -32,7 +32,10 @@ LmdbStorage::LmdbStorage(const std::string& db_path) : env_(nullptr), dbi_(0) {
         throw std::runtime_error("Failed to open database");
     }
 
-    mdb_txn_commit(txn);
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        throw std::runtime_error(std::string("Failed to commit init transaction: ") + mdb_strerror(rc));
+    }
 }
 
 LmdbStorage::~LmdbStorage() {
@@ -249,6 +252,97 @@ std::unordered_set<uint64_t> LmdbStorage::load_acks(const std::string& client_id
     mdb_txn_abort(txn);
 
     return acks;
+}
+
+void LmdbStorage::compact(uint64_t max_seq_to_delete) {
+    if (max_seq_to_delete == 0) return;
+
+    MDB_txn* txn = nullptr;
+    if (mdb_txn_begin(env_, nullptr, 0, &txn) != 0) return;
+
+    MDB_cursor* cursor = nullptr;
+    if (mdb_cursor_open(txn, dbi_, &cursor) != 0) {
+        mdb_txn_abort(txn);
+        return;
+    }
+
+    // Collect keys to delete (can't delete while iterating safely)
+    std::string prefix = "msg:";
+    MDB_val key, val;
+    key.mv_data = (void*)prefix.data();
+    key.mv_size = prefix.size();
+
+    std::vector<std::string> to_delete;
+    int rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+    while (rc == 0) {
+        std::string k(static_cast<char*>(key.mv_data), key.mv_size);
+        if (k.size() < 4 || k.substr(0, 4) != "msg:") break;
+        try {
+            uint64_t seq = std::stoull(k.substr(4));
+            if (seq <= max_seq_to_delete) to_delete.push_back(k);
+        } catch (...) {}
+        rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+    }
+    mdb_cursor_close(cursor);
+
+    uint64_t deleted = 0;
+    for (const auto& k : to_delete) {
+        MDB_val del_key;
+        del_key.mv_data = (void*)k.data();
+        del_key.mv_size = k.size();
+        if (mdb_del(txn, dbi_, &del_key, nullptr) == 0) ++deleted;
+    }
+
+    mdb_txn_commit(txn);
+    if (deleted > 0) {
+        std::cout << "[LmdbStorage] compact: removed " << deleted
+                  << " messages (seq <= " << max_seq_to_delete << ")\n";
+    }
+}
+
+void LmdbStorage::purge_old_acks(uint64_t max_seq_to_delete) {
+    if (max_seq_to_delete == 0) return;
+
+    MDB_txn* txn = nullptr;
+    if (mdb_txn_begin(env_, nullptr, 0, &txn) != 0) return;
+
+    MDB_cursor* cursor = nullptr;
+    if (mdb_cursor_open(txn, dbi_, &cursor) != 0) {
+        mdb_txn_abort(txn);
+        return;
+    }
+
+    // Scan all "ack:" keys
+    std::string prefix = "ack:";
+    MDB_val key, val;
+    key.mv_data = (void*)prefix.data();
+    key.mv_size = prefix.size();
+
+    std::vector<std::string> to_delete;
+    int rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+    while (rc == 0) {
+        std::string k(static_cast<char*>(key.mv_data), key.mv_size);
+        if (k.size() < 4 || k.substr(0, 4) != "ack:") break;
+        // key format: "ack:<client_id>:<seq>" — find last ':'
+        size_t last_colon = k.rfind(':');
+        if (last_colon != std::string::npos && last_colon > 3) {
+            try {
+                uint64_t seq = std::stoull(k.substr(last_colon + 1));
+                if (seq <= max_seq_to_delete) to_delete.push_back(k);
+            } catch (...) {}
+        }
+        rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+    }
+    mdb_cursor_close(cursor);
+
+    for (const auto& k : to_delete) {
+        MDB_val del_key;
+        del_key.mv_data = (void*)k.data();
+        del_key.mv_size = k.size();
+        mdb_del(txn, dbi_, &del_key, nullptr);
+    }
+
+    mdb_txn_commit(txn);
 }
 
 } // namespace metricmq::storage

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <vector>
+#include <array>
 
 namespace metricmq {
 
@@ -25,15 +26,21 @@ constexpr uint8_t BINARY_PROTOCOL_VERSION = 1;
 
 // Command types
 enum class BinaryCommand : uint8_t {
-    CMD_SUBSCRIBE   = 0x01,  // Client -> Broker: subscribe to topic
-    CMD_UNSUBSCRIBE = 0x02,  // Client -> Broker: unsubscribe from topic
-    CMD_PUBLISH     = 0x03,  // Client -> Broker: publish message
-    CMD_MESSAGE     = 0x04,  // Broker -> Client: deliver message
-    CMD_ACK         = 0x05,  // Client/Broker: acknowledge receipt
-    CMD_PING        = 0x06,  // Keepalive
-    CMD_PONG        = 0x07,  // Keepalive response
-    CMD_ERROR       = 0x08   // Error response
+    CMD_SUBSCRIBE      = 0x01,  // Client -> Broker: subscribe to topic
+    CMD_UNSUBSCRIBE    = 0x02,  // Client -> Broker: unsubscribe from topic
+    CMD_PUBLISH        = 0x03,  // Client -> Broker: publish message
+    CMD_MESSAGE        = 0x04,  // Broker -> Client: deliver message
+    CMD_ACK            = 0x05,  // Client/Broker: acknowledge receipt
+    CMD_PING           = 0x06,  // Keepalive
+    CMD_PONG           = 0x07,  // Keepalive response
+    CMD_ERROR          = 0x08,  // Error response
+    CMD_SIGNED_PUBLISH = 0x10,  // Client -> Broker: publish with Ed25519 signature
+    CMD_SIGNED_MESSAGE = 0x11   // Broker -> Client: deliver signed message
 };
+
+// Signature constants
+constexpr size_t SIGNATURE_SIZE = 64;  // Ed25519 signature
+constexpr size_t KEY_ID_SIZE = 4;      // 32-bit key identifier
 
 // Binary frame structure
 struct BinaryFrame {
@@ -42,6 +49,11 @@ struct BinaryFrame {
     uint64_t sequence;      // For exactly-once delivery
     std::string topic;
     std::string payload;
+    
+    // Signature fields (for CMD_SIGNED_PUBLISH/CMD_SIGNED_MESSAGE)
+    std::array<uint8_t, 64> signature{};  // Ed25519 signature
+    uint32_t key_id{0};                    // Identifier for public key lookup
+    bool is_signed{false};                 // Whether signature fields are valid
 
     BinaryFrame() : version(BINARY_PROTOCOL_VERSION), command(BinaryCommand::CMD_PING), sequence(0) {}
     
@@ -104,6 +116,36 @@ struct BinaryFrame {
         frame.payload = message;
         return frame;
     }
+
+    // Create a signed publish frame
+    static BinaryFrame signed_publish(const std::string& topic, const std::string& payload,
+                                      const std::array<uint8_t, 64>& sig, uint32_t key_id,
+                                      uint64_t seq = 0) {
+        BinaryFrame frame;
+        frame.command = BinaryCommand::CMD_SIGNED_PUBLISH;
+        frame.topic = topic;
+        frame.payload = payload;
+        frame.signature = sig;
+        frame.key_id = key_id;
+        frame.is_signed = true;
+        frame.sequence = seq;
+        return frame;
+    }
+
+    // Create a signed message frame (broker -> client)
+    static BinaryFrame signed_message(const std::string& topic, const std::string& payload,
+                                      const std::array<uint8_t, 64>& sig, uint32_t key_id,
+                                      uint64_t seq = 0) {
+        BinaryFrame frame;
+        frame.command = BinaryCommand::CMD_SIGNED_MESSAGE;
+        frame.topic = topic;
+        frame.payload = payload;
+        frame.signature = sig;
+        frame.key_id = key_id;
+        frame.is_signed = true;
+        frame.sequence = seq;
+        return frame;
+    }
 };
 
 class BinaryProtocol {
@@ -117,6 +159,10 @@ public:
 
     // Get minimum frame size (header only)
     static constexpr size_t MIN_FRAME_SIZE = 16;
+
+    // Hard limits to prevent OOM from malformed frames
+    static constexpr uint16_t MAX_TOPIC_LEN   = 256;
+    static constexpr uint32_t MAX_PAYLOAD_LEN = 16 * 1024 * 1024;  // 16 MB
 
     // Calculate total frame size for a given topic/payload
     static size_t calculateFrameSize(const std::string& topic, const std::string& payload) {

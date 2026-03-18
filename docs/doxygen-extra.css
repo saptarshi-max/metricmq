@@ -1,0 +1,5 @@
+/* Fix: constrain oversized project logo */
+#projectlogo img {
+    max-height: 60px !important;
+    width: auto !important;
+}
