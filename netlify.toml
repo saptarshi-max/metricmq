@@ -1,0 +1,8 @@
+[build]
+command = "doxygen Doxyfile"
+publish = "docs/doxygen/html"
+
+[build.environment]
+
+[context.production]
+environment = { NODE_ENV = "production" }
