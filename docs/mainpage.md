@@ -337,3 +337,4 @@ pwsh scripts/test_metrics.ps1
 
 - \ref md_docs_TECHNICAL "Technical Reference" — full API, wire format, defensive practices, known limitations
 - \ref md_docs_TESTING "Testing Guide" — how to run every test and interpret results
+- \ref md_docs_PLATFORMIO_GUIDE "PlatformIO Guide" — step-by-step setup for MetricMQ on ESP devices

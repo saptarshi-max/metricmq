@@ -18,7 +18,8 @@ INPUT                  = include/metricmq \
                          src \
                          examples \
                          esp32-metricmq/src \
-                         docs/mainpage.md
+                         docs/mainpage.md \
+                         docs/PLATFORMIO_GUIDE.md
 
 RECURSIVE              = YES
 

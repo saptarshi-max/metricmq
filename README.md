@@ -810,12 +810,19 @@ LMDB Persistence (direct, no broker):
 | ESP32 generic | 4 MB | 4 MB | Fully supported |
 | ESP8266 | 160 KB | 4 MB | Works but RAM is very tight |
 
-### Arduino IDE Setup
+### Arduino IDE & PlatformIO Setup
 
+**For PlatformIO (Recommended):**
+Add the dedicated client repository directly to your `platformio.ini`:
+```ini
+lib_deps = https://github.com/Saptarshi-max/MetricMQ.git
+```
+
+**For Arduino IDE:**
 1. Preferences → Additional Board Manager URLs:
    `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
 2. Tools → Board Manager → Install **esp32 by Espressif Systems**
-3. Copy `esp32-metricmq/` to `~/Documents/Arduino/libraries/MetricMQ`
+3. Clone or download [MetricMQ](https://github.com/Saptarshi-max/MetricMQ) into your `~/Documents/Arduino/libraries/` folder
 4. Board: `ESP32S3 Dev Module`, USB CDC On Boot: `Enabled`
 
 ### Basic ESP32 Sketch
@@ -826,13 +833,20 @@ LMDB Persistence (direct, no broker):
 
 MetricMQClient client;
 
+// WARNING: Do not commit your WiFi credentials or secrets to public version control!
+const char* BROKER_HOST = "192.168.1.100";  // CHANGE THIS TO YOUR BROKER IP
+
 void setup() {
     Serial.begin(115200);
     WiFi.begin("YourSSID", "YourPass");
     while (WiFi.status() != WL_CONNECTED) delay(500);
 
+    if (String(BROKER_HOST) == "192.168.1.100") {
+        Serial.println("\n[WARNING] Please update BROKER_HOST to your actual IP!\n");
+    }
+
     // Step 1: store broker address
-    client.begin("192.168.1.100", 6379);
+    client.begin(BROKER_HOST, 6379);
     // Step 2: connect (optionally pass client_id for exactly-once replay)
     client.connect("esp32-node-01");
 
@@ -1148,6 +1162,7 @@ New-NetFirewallRule -DisplayName "MetricMQ" `
 | `EXACTLY_ONCE_COMPLETE.md` | ACK tracking design and data flow |
 | `ESP32_SECURITY_DEMO_GUIDE.md` | Full Ed25519 security demo walkthrough |
 | `BENCHMARK_COMPLETE.md` | Google Benchmark integration guide |
+| `docs/PLATFORMIO_GUIDE.md` | Detailed setup for compiling on ESP hardware |
 | `esp32-metricmq/README.md` | ESP32 Arduino library documentation |
 
 ---
